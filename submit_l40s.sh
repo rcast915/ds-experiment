@@ -33,6 +33,9 @@ singularity exec --nv --writable \
     set -e
     cd /src/ds_experiment
     bash ds_setup.sh
+    echo "[setup] Building mlir-ds-opt (shadowed by bind mount, must rebuild)..."
+    cmake -GNinja -S stablehlo_pass -B stablehlo_pass/build -DCMAKE_CXX_FLAGS="-fno-rtti" > /dev/null
+    ninja -C stablehlo_pass/build
     bash tests/run_tests.sh --bench
   '
 
