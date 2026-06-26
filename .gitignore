@@ -1,0 +1,10 @@
+# Build artifacts
+**/build/
+**/__pycache__/
+*.so
+*.pyc
+*.o
+
+# Logs
+logs/output/
+logs/error/

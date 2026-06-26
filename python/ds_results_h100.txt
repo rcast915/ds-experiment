@@ -1,0 +1,21 @@
+The initial DS CPU implementation incurs a ~20–45× overhead relative to native arithmetic on CPU, primarily due to increased arithmetic and lack of operation fusion. The overhead scales linearly with problem size, indicating that it is dominated by per-element computation and memory traffic rather than fixed overheads.
+
+In the current CPU implementation, DS overhead is dominated by arithmetic work rather than FFI dispatch overhead, and a simple fused custom op does not improve performance. On the CPU, the DS implementation is compute-heavy enough that reducing call boundaries alone is insufficient.
+
+On the CPU, the current DS implementation provides substantial numerical benefits over float32 in cancellation-sensitive expressions, but incurs a large overhead of roughly 25–50× versus native arithmetic. Fusion of multiple DS operations into a single FFI kernel provides little benefit, indicating that the dominant cost is the DS arithmetic itself rather than FFI dispatch or intermediate buffer traffic.
+
+Per-op benchmarking shows that the dominant overhead in the current CPU double-single prototype comes from the DS arithmetic kernels rather than FFI dispatch or conversion overhead. At N = 10^6, ds_add and ds_sub cost about 16 ms each and ds_mul about 20 ms, while conversions cost only 2–3 ms. This explains why fusion alone yields little speedup -- the overall runtime is dominated by the computational cost of DS arithmetic itself.
+
+On the GPU, the fused double-single implementation is far more competitive than on the CPU. For large vectors, its runtime is within a few percent of native float64 and under 2× the cost of float32, while maintaining very small numerical error relative to float64 on the benchmark_ds_gpu_clean.py benchmark.
+
+On the GPU, the fused double-single implementation preserves small perturbations in cancellation-sensitive expressions far better than float32 and often better than naive float64 evaluation of the same unstable formula, while running at a cost close to native float64 and under 2× the cost of float32 for large vectors on the benchmark_ds_gpu_cancellation.py benchmark.
+
+A single fused DS GPU custom call is competitive with native float64, but increasing arithmetic intensity through repeated DS custom calls leads to steep slowdown because XLA cannot fuse across custom-call boundaries, whereas native JAX kernels remain highly optimized as shown by the benchmark_ds_gpu_intensity_sweep.py benchmark.
+
+When DS arithmetic is expressed as many separate custom calls, performance degrades severely as arithmetic intensity increases. But when the recurrence is fused into a single internally-looped GPU custom call, the slowdown is dramatically reduced while preserving
+
+near float64 accuracy, as shown by the benchmark_ds_gpu_intensity_sweep_internal.py benchmark.
+
+On the GPU, double-single arithmetic is competitive with native float64 for low-intensity fused kernels and remains efficient under higher arithmetic intensity when a recurrence is fused into a single internally-looped custom call.
+
+To handle arbitrary user code, the next step is to implement DS with a compiler transformation pass over the IR, not as hand-written FFI calls in user code.
