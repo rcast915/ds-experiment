@@ -33,16 +33,39 @@ rounding residual forward in the `lo` component through all subsequent ops.
 
 ### What this gives you
 
-DS-f32 runs at approximately **f32 hardware speed** while delivering
-**near-f64 numerical accuracy** (~48-bit mantissa vs f64's 53 bits).
+The core claim is: **DS-f32 achieves near-f64 numerical accuracy at
+approximately f32 hardware cost.**  What "f32 cost" means in practice
+depends on the target:
 
-- On GPUs with poor f64 support (consumer cards, mobile, embedded), this
-  is a direct speedup over f64 with near-identical precision.
-- On HPC GPUs with native f64 units (H100), DS-f32 matches f64 wall time
-  while using only f32 arithmetic paths throughout — giving f64-class
-  accuracy with no performance penalty compared to f64.
-- In all cases, DS-f32 is substantially more accurate than plain f32:
-  measured 8× lower error for large reductions.
+- On **consumer GPUs and hardware without native f64 units** (mobile,
+  embedded), f64 throughput is typically 1/32–1/64 of f32 throughput.
+  DS-f32 runs at f32 speed on those paths, making it dramatically faster
+  than f64 while preserving near-f64 accuracy.
+- On **HPC GPUs with native f64 units (e.g. H100)**, both f64 and DS-f32
+  are fully hardware-accelerated, so wall times are comparable. DS-f32
+  still uses only f32 arithmetic paths and f32 memory bandwidth, which
+  is a meaningful advantage at scale, and delivers f64-class accuracy
+  with no performance penalty relative to native f64.
+- In **all cases**, DS-f32 is substantially more accurate than plain f32:
+  measured **8× lower error** for large reductions (~1.49e-05 vs ~1.22e-04
+  for a 10,000-element reduction).
+
+### Why a compiler pass — not hand-written kernels
+
+Early experiments used hand-written FFI custom calls to implement DS
+operations on the GPU.  These performed well for single fused kernels, but
+performance degraded steeply as arithmetic intensity increased: XLA cannot
+fuse across `custom_call` boundaries, so each DS operation became a
+separate kernel launch with no cross-op optimization.  Fusing entire
+recurrences into a single internally-looped custom call helped, but
+required manual kernel authoring for every operation pattern.
+
+The compiler pass solves this structurally.  By emitting DS sequences as
+**native StableHLO ops**, the pass hands XLA a single expanded program
+with no opaque boundaries — XLA schedules, fuses, and register-allocates
+across the entire kernel exactly as it would for hand-written f32 code.
+The arithmetic-intensity slowdown disappears, and no hand-written CUDA
+kernels are needed.
 
 ### How it works (transparently)
 
@@ -133,6 +156,53 @@ stablehlo-legalize-to-vhlo        # convert back to VHLO for XLA
 | `DS_BYPASS=1` | Skip all transformation; pure passthrough to real backend |
 | `DS_TEST_PASSTHROUGH=1` | Run DS pass but send original bytecode to backend |
 | `DS_PASS_MODE=ffi` | Use FFI pass instead of inline pass (for debugging only) |
+
+---
+
+## Experimental Results (H100)
+
+Results collected on Punakha HPC, node `hopper001` (NVIDIA H100, CUDA 12.9.1).
+Full notes: `python/ds_results_h100.txt`, `python/ds_results_compiler_pass_h100.txt`.
+
+### FFI prototype (early experiments)
+
+The initial implementation used hand-written FFI custom calls to dispatch DS
+operations on the GPU.  Key findings:
+
+- **Single fused kernel:** competitive with native f64 — within a few percent
+  for large vectors, under 2× the cost of f32.
+- **Cancellation sensitivity:** DS preserved small perturbations far better
+  than f32 and often better than naive f64 evaluation of the same numerically
+  unstable formula.
+- **Fusion bottleneck:** as arithmetic intensity increased (more DS ops per
+  kernel), performance degraded steeply because XLA cannot fuse across
+  `custom_call` boundaries. Fusing entire recurrences into a single
+  internally-looped custom call reduced the slowdown but required manual
+  authoring per operation pattern. This identified the need for a compiler pass.
+
+### Compiler pass (current implementation)
+
+The inline DS pass emits native StableHLO, eliminating the fusion boundary
+entirely.  Results on H100:
+
+| Workload | DS-f32 vs f64 | DS-f32 vs f32 |
+|---|---|---|
+| Element-wise (A\*A+B), 1K–1M elements | within 10% | ~2× slower |
+| `jnp.sum` reduction, 1K–1M elements | within 10% | ~2× slower |
+| `jnp.matmul` 2048×2048 | **1.13× faster** | — |
+| `jnp.matmul` 256×256 | 0.72× (4 launches vs 1) | — |
+
+**Why DS-f32 ≈ f64 speed on H100:** the H100 has native FP64 tensor cores
+(~51 TFLOPS PCIe), so f64 is already hardware-accelerated. The comparison
+is different on consumer GPUs where f64 throughput is 1/32–1/64 of f32.
+
+**Precision:** for a 10,000-element reduction, DS-f32 error is 1.49e-05 vs
+f32 error of 1.22e-04 — an **8× improvement**, consistent with DS-f32's
+effective ~48-bit mantissa.
+
+**FMA safety confirmed:** PTX inspection on H100 shows zero `fma.rn.f32`
+instructions in the Veltkamp split sequence.  Per-instruction IEEE `.rn`
+rounding prevents contraction at the PTX assembler level.
 
 ---
 
