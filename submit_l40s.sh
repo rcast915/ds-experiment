@@ -23,6 +23,9 @@ echo "=== [2/3] Building writable sandbox on \$LOCAL ==="
 SANDBOX="$LOCAL/ds-sandbox"
 singularity build --sandbox "$SANDBOX" "$SIF"
 
+# Create Bridges-2 filesystem mount points that Apptainer expects
+mkdir -p "$SANDBOX/jet" "$SANDBOX/ocean"
+
 echo "=== [3/4] Running setup and tests inside container ==="
 singularity exec --nv --writable \
   --bind "$PROJECT_DIR":/src/ds_experiment \
