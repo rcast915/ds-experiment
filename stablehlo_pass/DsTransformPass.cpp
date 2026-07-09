@@ -43,6 +43,8 @@ struct PassPluginLibraryInfo {
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/DenseMap.h"
 
+#include <cstdlib>
+#include <string>
 #include <utility>
 
 using namespace mlir;
@@ -209,6 +211,16 @@ struct DsTransformPass
 
     // Maps each original float Value → its DS pair (hi, lo).
     llvm::DenseMap<Value, std::pair<Value, Value>> dsMap;
+
+    // DS_RETURN_PAIRS=1 (opt-in, off by default): see the func.return
+    // handler in processOps() for what this changes. Read directly from
+    // the environment (mirroring DS_BYPASS/DS_TEST_PASSTHROUGH/DS_PASS_MODE
+    // in ds_pjrt_plugin.cpp) rather than as an MLIR pass option, since
+    // mlir-ds-opt is always spawned as a child process that inherits the
+    // caller's environment (ds_pjrt_plugin.cpp's run_command() passes
+    // `environ` straight through to posix_spawn) -- no plumbing through
+    // the pass-pipeline string is needed.
+    bool returnPairs = false;
 
     // ── Entry: split function arguments into DS pairs ─────────────────────
     void convertFuncArgs(func::FuncOp func) {
@@ -448,14 +460,57 @@ struct DsTransformPass
             }
 
             // ── func.return: recombine DS pairs back to original type ─────
+            //
+            // Default (returnPairs == false): every dsMap-tracked operand is
+            // recombined to its original f32/f64 type via emitToFloat --
+            // this branch is byte-for-byte the pre-existing behavior,
+            // unconditionally, so DS_RETURN_PAIRS=0/unset cannot change it.
+            //
+            // DS_RETURN_PAIRS=1: if the *same* dsMap-tracked SSA value is
+            // returned twice in one func.return (e.g. `return %s, %s` for a
+            // DS-tracked %s), the first occurrence is replaced with its raw
+            // `hi` component and the second with its raw `lo` component --
+            // skipping emitToFloat's recombination entirely for that pair
+            // of operands -- so the caller can recombine in f64 on the host
+            // instead of losing precision to an f32 return (see
+            // ds_reeval/exp3_pair_accuracy.py and
+            // ds_reeval/test_return_pairs_structural.py).
+            //
+            // This only ever substitutes a value of the *same type* as the
+            // operand it replaces (guarded by `orig.getType() ==
+            // hi.getType()`, i.e. the operand's declared return type must
+            // already be f32, which hi/lo always are) -- so the FuncOp's
+            // result-type signature never needs to change, and there is no
+            // risk of emitting ill-typed IR or changing the function's
+            // arity as JAX originally traced it. f64-typed returns (hi/lo
+            // are f32 but the declared return type is f64) always fall
+            // back to normal recombination below, since substituting an
+            // f32 value for an f64 result would be ill-typed; extending
+            // DS_RETURN_PAIRS to that case would additionally require
+            // updating func.getFunctionType(), which is out of scope here.
+            // A value returned only once, or a third+ occurrence of the
+            // same value, is unaffected either way (falls through to
+            // ordinary recombination) -- this deliberately only special-
+            // cases the exact doubled-return pattern above.
             if (auto retOp = dyn_cast<func::ReturnOp>(op)) {
                 OpBuilder rb(retOp);
+                llvm::DenseMap<Value, int> seen;
                 for (auto& operand : retOp->getOpOperands()) {
-                    if (!dsMap.count(operand.get())) continue;
-                    auto [hi, lo] = dsMap[operand.get()];
-                    Value combined = emitToFloat(rb, loc, hi, lo,
-                                               operand.get().getType());
-                    operand.set(combined);
+                    Value orig = operand.get();
+                    if (!dsMap.count(orig)) continue;
+                    auto [hi, lo] = dsMap[orig];
+
+                    bool substitutedPair = false;
+                    if (returnPairs && orig.getType() == hi.getType()) {
+                        int idx = seen[orig];
+                        seen[orig] = idx + 1;
+                        if (idx == 0) { operand.set(hi); substitutedPair = true; }
+                        else if (idx == 1) { operand.set(lo); substitutedPair = true; }
+                    }
+                    if (!substitutedPair) {
+                        Value combined = emitToFloat(rb, loc, hi, lo, orig.getType());
+                        operand.set(combined);
+                    }
                 }
                 continue;
             }
@@ -471,6 +526,8 @@ struct DsTransformPass
     void runOnOperation() override {
         func::FuncOp func = getOperation();
         dsMap.clear();
+        const char* rp = std::getenv("DS_RETURN_PAIRS");
+        returnPairs = rp && std::string(rp) == "1";
         convertFuncArgs(func);
         processOps(func);
     }

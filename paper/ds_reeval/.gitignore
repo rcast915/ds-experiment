@@ -1,0 +1,18 @@
+# Everything under here is produced by actually running the suite on a GPU
+# node -- never hand-authored, never committed. If you're looking at a diff
+# that adds files under any of these paths, something upstream ran the
+# suite instead of just building it.
+results/
+smoke_out/
+xla_dumps/
+**/xla_dumps/
+*.nsys-rep
+*.qdrep
+*.sqlite
+REPORT.md
+SMOKE_REPORT.md
+
+# Ordinary Python/editor noise.
+__pycache__/
+*.pyc
+*.tmp
