@@ -64,6 +64,55 @@ def ds_mul(ah, al, bh, bl):
     return s, np.float32(e1 + e2 + al * bl)
 
 
+# ── Trivial / comparison ops (ported from double-single-lib) ───────────────────
+#
+# Mirrors DsTransformPass.cpp's emitDsAbs/emitDsCompare, which were ported
+# from double_single_ray/llvm-accuracy-analysis-k-test/double-single-lib's
+# double_binary32_neg/fabs/compare -- see that library for the authoritative
+# reference.
+
+def ds_negate(h, l):
+    return np.float32(-np.float32(h)), np.float32(-np.float32(l))
+
+
+def ds_abs(h, l):
+    """hi >= -lo (not sign(hi) alone) -- handles hi==0.0, lo<0 correctly."""
+    h = np.float32(h); l = np.float32(l)
+    if h >= -l:
+        return h, l
+    return np.float32(-h), np.float32(-l)
+
+
+def ds_compare(ah, al, bh, bl):
+    """Hi-first, lo-tiebreak lexicographic compare.
+
+    Returns -1 (a<b), 0 (a==b), 1 (a>b), or None (unordered -- NaN present).
+    """
+    ah = np.float32(ah); al = np.float32(al)
+    bh = np.float32(bh); bl = np.float32(bl)
+    if not (ah == ah and al == al and bh == bh and bl == bl):
+        return None
+    if ah > bh or (ah == bh and al > bl):
+        return 1
+    if ah < bh or (ah == bh and al < bl):
+        return -1
+    return 0
+
+
+def ds_max(ah, al, bh, bl):
+    order = ds_compare(ah, al, bh, bl)
+    if order is None:
+        return float('nan'), float('nan')
+    return (ah, al) if order >= 0 else (bh, bl)
+
+
+def ds_min(ah, al, bh, bl):
+    order = ds_compare(ah, al, bh, bl)
+    if order is None:
+        return float('nan'), float('nan')
+    return (ah, al) if order <= 0 else (bh, bl)
+
+
 # ── Higher-level operations ───────────────────────────────────────────────────
 
 def ds_dot(a, b):

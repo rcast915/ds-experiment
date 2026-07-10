@@ -14,8 +14,28 @@
 //   stablehlo.add       → ds_add  (two_sum sequences)
 //   stablehlo.subtract  → ds_sub
 //   stablehlo.multiply  → ds_mul  (two_prod + two_sum sequences)
+//   stablehlo.negate    → ds_negate (negate both components)
+//   stablehlo.abs       → ds_abs  (conditional negate, ported from
+//                         double-single-lib's double_binary32_fabs)
+//   stablehlo.compare   → ds_compare (hi-first, lo-tiebreak lexicographic,
+//                         ported from double_binary32_compare)
+//   stablehlo.select    → applies the same predicate to both components
+//   stablehlo.maximum/minimum → built from ds_compare + select
 //   func entry args     → split into (hi, lo) via emitFromFloat
 //   func return values  → recombined via emitToFloat
+//
+// Ops in this table other than add/sub/mul/negate/abs/compare/select/
+// maximum/minimum, dot_general, and reduce are NOT DS-transformed: a
+// DS-tracked operand flowing into one of them silently reverts to native
+// f32 precision from that point on. Set DS_WARN_UNSUPPORTED=1 to have the
+// pass report these to stderr as they're encountered (op name + location);
+// default behavior (unset) is unchanged.
+//
+// negate/abs/compare ported from
+// double_single_ray/llvm-accuracy-analysis-k-test/double-single-lib
+// (double_binary32_neg/fabs/compare) -- see that library for the
+// authoritative reference and handoff.md for port notes. divide and sqrt
+// are ported from the same library in a later change, not this one.
 //
 //===----------------------------------------------------------------------===//
 
@@ -165,6 +185,63 @@ static std::pair<Value, Value> emitDsMul(OpBuilder& bld, Location loc,
     return {s, out_lo};
 }
 
+// ds_abs((a_hi, a_lo)) → (out_hi, out_lo)
+// Ported from double-single-lib's double_binary32_fabs. The condition is
+// hi >= -lo (equivalently hi + lo >= 0), NOT sign(hi) alone: this
+// correctly handles the case hi == 0.0 with lo < 0, where the represented
+// value is actually negative but hi's own sign says otherwise. Do not
+// "simplify" this to a per-component abs or a hi-only sign test -- lo's
+// sign is correlated with hi's, and both of those alternatives are wrong.
+static std::pair<Value, Value> emitDsAbs(OpBuilder& bld, Location loc,
+                                          Value a_hi, Value a_lo) {
+    Value neg_lo  = bld.create<stablehlo::NegOp>(loc, a_lo);
+    Value cond    = bld.create<stablehlo::CompareOp>(loc, a_hi, neg_lo,
+                        stablehlo::ComparisonDirection::GE);
+    Value neg_hi  = bld.create<stablehlo::NegOp>(loc, a_hi);
+    Value out_hi  = bld.create<stablehlo::SelectOp>(loc, cond, a_hi, neg_hi);
+    Value out_lo  = bld.create<stablehlo::SelectOp>(loc, cond, a_lo, neg_lo);
+    return {out_hi, out_lo};
+}
+
+// ds_compare((a_hi, a_lo), (b_hi, b_lo), direction) → boolean tensor
+// Ported from double-single-lib's double_binary32_compare: lexicographic,
+// hi compared first, lo breaks ties. NaN handling is not special-cased --
+// it falls out for free from stablehlo.compare's own IEEE-754 NaN
+// semantics on the underlying hi/hi and lo/lo comparisons (ordered
+// comparisons with NaN are false, NE with NaN is true), exactly matching
+// what the library computes by hand via explicit (x == x) checks.
+//
+// For LE/GE, the hi-component comparison must use the *strict* form (LT
+// for LE, GT for GE, not the requested non-strict one) so a hi-tie doesn't
+// short-circuit the OR before the lo tiebreak is consulted; the lo
+// comparison uses the actual requested direction. LT/GT are already
+// strict, so they're their own "strict form". EQ/NE are handled directly
+// rather than through this hi/lo-OR pattern, matching the library's
+// explicit per-case structure.
+static Value emitDsCompare(OpBuilder& bld, Location loc,
+                            Value a_hi, Value a_lo, Value b_hi, Value b_lo,
+                            stablehlo::ComparisonDirection dir) {
+    using CD = stablehlo::ComparisonDirection;
+    Value hiEq = bld.create<stablehlo::CompareOp>(loc, a_hi, b_hi, CD::EQ);
+
+    if (dir == CD::EQ) {
+        Value loEq = bld.create<stablehlo::CompareOp>(loc, a_lo, b_lo, CD::EQ);
+        return bld.create<stablehlo::AndOp>(loc, hiEq, loEq);
+    }
+    if (dir == CD::NE) {
+        Value hiNe = bld.create<stablehlo::CompareOp>(loc, a_hi, b_hi, CD::NE);
+        Value loNe = bld.create<stablehlo::CompareOp>(loc, a_lo, b_lo, CD::NE);
+        return bld.create<stablehlo::OrOp>(loc, hiNe,
+                   bld.create<stablehlo::AndOp>(loc, hiEq, loNe));
+    }
+
+    CD strictHiDir = (dir == CD::LE) ? CD::LT : (dir == CD::GE) ? CD::GT : dir;
+    Value hiCmp = bld.create<stablehlo::CompareOp>(loc, a_hi, b_hi, strictHiDir);
+    Value loCmp = bld.create<stablehlo::CompareOp>(loc, a_lo, b_lo, dir);
+    return bld.create<stablehlo::OrOp>(loc, hiCmp,
+               bld.create<stablehlo::AndOp>(loc, hiEq, loCmp));
+}
+
 // Split an f32/f64 tensor into a DS (hi, lo) pair.
 //   For f64: hi = float(v),  lo = float(v - double(hi))
 //   For f32: hi = v,         lo = 0  (already exact)
@@ -221,6 +298,11 @@ struct DsTransformPass
     // `environ` straight through to posix_spawn) -- no plumbing through
     // the pass-pipeline string is needed.
     bool returnPairs = false;
+
+    // DS_WARN_UNSUPPORTED=1 (opt-in, off by default): see the fallback
+    // check at the end of processOps()'s op loop. Same getenv-based
+    // mechanism as returnPairs above, for the same reason.
+    bool warnUnsupported = false;
 
     // ── Entry: split function arguments into DS pairs ─────────────────────
     void convertFuncArgs(func::FuncOp func) {
@@ -328,6 +410,108 @@ struct DsTransformPass
                 auto [b_hi, b_lo] = dsMap[mulOp.getRhs()];
                 auto [r_hi, r_lo] = emitDsMul(b, loc, a_hi, a_lo, b_hi, b_lo);
                 dsMap[mulOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.negate ──────────────────────────────────────────
+            if (auto negOp = dyn_cast<stablehlo::NegOp>(op)) {
+                if (!isFloatTensor(negOp.getResult())) continue;
+                if (!dsMap.count(negOp.getOperand())) continue;
+
+                auto [a_hi, a_lo] = dsMap[negOp.getOperand()];
+                Value r_hi = b.create<stablehlo::NegOp>(loc, a_hi);
+                Value r_lo = b.create<stablehlo::NegOp>(loc, a_lo);
+                dsMap[negOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.abs ─────────────────────────────────────────────
+            if (auto absOp = dyn_cast<stablehlo::AbsOp>(op)) {
+                if (!isFloatTensor(absOp.getResult())) continue;
+                if (!dsMap.count(absOp.getOperand())) continue;
+
+                auto [a_hi, a_lo] = dsMap[absOp.getOperand()];
+                auto [r_hi, r_lo] = emitDsAbs(b, loc, a_hi, a_lo);
+                dsMap[absOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.compare ─────────────────────────────────────────
+            // Result is a boolean tensor, not a float one -- it is never
+            // entered into dsMap; instead its uses are rewired directly to
+            // the computed boolean (e.g. a following stablehlo.select).
+            // dsMap only ever contains float-tensor keys, so checking
+            // dsMap.count() on both operands is sufficient to confirm they
+            // are DS-tracked floats -- no separate isFloatTensor check on
+            // the operands is needed.
+            if (auto cmpOp = dyn_cast<stablehlo::CompareOp>(op)) {
+                if (!dsMap.count(cmpOp.getLhs()) ||
+                    !dsMap.count(cmpOp.getRhs())) continue;
+
+                auto [a_hi, a_lo] = dsMap[cmpOp.getLhs()];
+                auto [b_hi, b_lo] = dsMap[cmpOp.getRhs()];
+                Value result = emitDsCompare(b, loc, a_hi, a_lo, b_hi, b_lo,
+                                              cmpOp.getComparisonDirection());
+                cmpOp.getResult().replaceAllUsesWith(result);
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.select ──────────────────────────────────────────
+            // The predicate itself is a plain boolean tensor (possibly
+            // produced by the ds_compare handler above, possibly not) --
+            // not DS-tracked; the same predicate applies to both hi and lo.
+            if (auto selOp = dyn_cast<stablehlo::SelectOp>(op)) {
+                if (!isFloatTensor(selOp.getResult())) continue;
+                if (!dsMap.count(selOp.getOnTrue()) ||
+                    !dsMap.count(selOp.getOnFalse())) continue;
+
+                Value pred = selOp.getPred();
+                auto [t_hi, t_lo] = dsMap[selOp.getOnTrue()];
+                auto [f_hi, f_lo] = dsMap[selOp.getOnFalse()];
+                Value r_hi = b.create<stablehlo::SelectOp>(loc, pred, t_hi, f_hi);
+                Value r_lo = b.create<stablehlo::SelectOp>(loc, pred, t_lo, f_lo);
+                dsMap[selOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.maximum / stablehlo.minimum ─────────────────────
+            // Not in double-single-lib (it has no max/min routine) -- built
+            // from ds_compare + select per the task's own instruction, since
+            // that composition is straightforward and introduces no new
+            // rounding behavior beyond what compare/select already have.
+            if (auto maxOp = dyn_cast<stablehlo::MaxOp>(op)) {
+                if (!isFloatTensor(maxOp.getResult())) continue;
+                if (!dsMap.count(maxOp.getLhs()) ||
+                    !dsMap.count(maxOp.getRhs())) continue;
+
+                auto [a_hi, a_lo] = dsMap[maxOp.getLhs()];
+                auto [b_hi, b_lo] = dsMap[maxOp.getRhs()];
+                Value cond = emitDsCompare(b, loc, a_hi, a_lo, b_hi, b_lo,
+                                            stablehlo::ComparisonDirection::GE);
+                Value r_hi = b.create<stablehlo::SelectOp>(loc, cond, a_hi, b_hi);
+                Value r_lo = b.create<stablehlo::SelectOp>(loc, cond, a_lo, b_lo);
+                dsMap[maxOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            if (auto minOp = dyn_cast<stablehlo::MinOp>(op)) {
+                if (!isFloatTensor(minOp.getResult())) continue;
+                if (!dsMap.count(minOp.getLhs()) ||
+                    !dsMap.count(minOp.getRhs())) continue;
+
+                auto [a_hi, a_lo] = dsMap[minOp.getLhs()];
+                auto [b_hi, b_lo] = dsMap[minOp.getRhs()];
+                Value cond = emitDsCompare(b, loc, a_hi, a_lo, b_hi, b_lo,
+                                            stablehlo::ComparisonDirection::LE);
+                Value r_hi = b.create<stablehlo::SelectOp>(loc, cond, a_hi, b_hi);
+                Value r_lo = b.create<stablehlo::SelectOp>(loc, cond, a_lo, b_lo);
+                dsMap[minOp.getResult()] = {r_hi, r_lo};
                 toErase.push_back(op);
                 continue;
             }
@@ -514,6 +698,30 @@ struct DsTransformPass
                 }
                 continue;
             }
+
+            // ── DS_WARN_UNSUPPORTED=1 diagnostic ──────────────────────────
+            // Reached only if none of the handlers above matched this op.
+            // If it produces a float-typed result from a DS-tracked
+            // operand, DS precision silently reverts to native f32 from
+            // this point on -- report it if the human opted in. No
+            // "continue" needed: this is the last check in the loop body.
+            if (warnUnsupported) {
+                bool hasFloatResult = false;
+                for (Value result : op->getResults()) {
+                    if (isFloatTensor(result)) { hasFloatResult = true; break; }
+                }
+                bool hasDsTrackedOperand = false;
+                for (Value operand : op->getOperands()) {
+                    if (dsMap.count(operand)) { hasDsTrackedOperand = true; break; }
+                }
+                if (hasFloatResult && hasDsTrackedOperand) {
+                    llvm::errs() << "[ds-transform] WARNING: unsupported op '"
+                                 << op->getName() << "' at " << op->getLoc()
+                                 << " consumes a DS-tracked operand but is not "
+                                 << "transformed -- downstream DS precision "
+                                 << "degrades to native f32 from this point.\n";
+                }
+            }
         }
 
         // Erase replaced ops in reverse order (same as Skeleton.cpp)
@@ -528,6 +736,8 @@ struct DsTransformPass
         dsMap.clear();
         const char* rp = std::getenv("DS_RETURN_PAIRS");
         returnPairs = rp && std::string(rp) == "1";
+        const char* wu = std::getenv("DS_WARN_UNSUPPORTED");
+        warnUnsupported = wu && std::string(wu) == "1";
         convertFuncArgs(func);
         processOps(func);
     }
