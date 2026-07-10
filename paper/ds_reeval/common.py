@@ -9,6 +9,7 @@ os.environ *before* it (or anything it imports) imports jax. Every function
 here that needs jax/numpy imports it lazily, inside the function body, so
 that `import common` itself is always safe regardless of env-var ordering.
 """
+import glob
 import json
 import os
 import shutil
@@ -51,33 +52,82 @@ def snapshot_relevant_env():
     return {k: os.environ.get(k) for k in _RELEVANT_ENV_KEYS}
 
 
-def detect_gpu(required=True):
-    """Returns {'name', 'driver_version', 'compute_cap', 'arch'} via nvidia-smi.
+# Name substrings -> arch, for the procfs fallback below (which has no
+# compute_cap field to look up against _ARCH_BY_COMPUTE_CAP).
+_ARCH_BY_NAME_SUBSTRING = [
+    ("H100", "sm_90a"),
+    ("L40S", "sm_89"),
+]
 
-    If nvidia-smi is unavailable and required=False, returns an
-    'UNKNOWN-GPU' placeholder instead of raising, so `run_all.py --dry-run`
-    can print a plan from a login node with no GPU attached. Real (non
-    dry-run) invocations must call this with required=True: a result file
-    tagged with an unknown GPU defeats the purpose of tagging at all.
+
+def _detect_gpu_via_nvidia_smi():
+    proc = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,driver_version,compute_cap",
+         "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=15, check=True,
+    )
+    line = proc.stdout.strip().splitlines()[0]
+    parts = [p.strip() for p in line.split(",")]
+    name, driver, cc = parts[0], parts[1], parts[2]
+    arch = _ARCH_BY_COMPUTE_CAP.get(cc, "sm_" + cc.replace(".", ""))
+    return {"name": name, "driver_version": driver, "compute_cap": cc, "arch": arch}
+
+
+def _detect_gpu_via_procfs():
+    """Fallback for containers where the GPU device is accessible (CUDA
+    works fine) but the `nvidia-smi` CLI tool isn't in the image -- seen in
+    practice under Singularity/Apptainer `--nv`, which bind-mounts the
+    driver's shared libraries but not necessarily its utility binaries,
+    unlike Docker's `--gpus`. Reads directly from the kernel driver's
+    procfs interface instead, which requires no userspace tooling at all
+    beyond the driver already being loaded on the host (a prerequisite for
+    `--nv`/`--gpus` to work in the first place).
+    """
+    info_files = sorted(glob.glob("/proc/driver/nvidia/gpus/*/information"))
+    if not info_files:
+        return None
+    try:
+        with open(info_files[0]) as f:
+            content = f.read()
+    except OSError:
+        return None
+    name = None
+    for line in content.splitlines():
+        if line.strip().lower().startswith("model:"):
+            name = line.split(":", 1)[1].strip()
+            break
+    if not name:
+        return None
+    arch = next((a for sub, a in _ARCH_BY_NAME_SUBSTRING if sub in name.upper()), "unknown")
+    return {"name": name, "driver_version": "unknown (nvidia-smi unavailable)",
+            "compute_cap": "unknown", "arch": arch}
+
+
+def detect_gpu(required=True):
+    """Returns {'name', 'driver_version', 'compute_cap', 'arch'}.
+
+    Tries nvidia-smi first, falls back to reading the kernel driver's
+    procfs interface directly if that's not on PATH (see
+    _detect_gpu_via_procfs for why that happens in practice). If both fail
+    and required=False, returns an 'UNKNOWN-GPU' placeholder instead of
+    raising, so `run_all.py --dry-run` can print a plan from a login node
+    with no GPU attached. Real (non dry-run) invocations must call this
+    with required=True: a result file tagged with an unknown GPU defeats
+    the purpose of tagging at all.
     """
     try:
-        proc = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,driver_version,compute_cap",
-             "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=15, check=True,
-        )
-        line = proc.stdout.strip().splitlines()[0]
-        parts = [p.strip() for p in line.split(",")]
-        name, driver, cc = parts[0], parts[1], parts[2]
-        arch = _ARCH_BY_COMPUTE_CAP.get(cc, "sm_" + cc.replace(".", ""))
-        return {"name": name, "driver_version": driver, "compute_cap": cc, "arch": arch}
-    except Exception as e:
+        return _detect_gpu_via_nvidia_smi()
+    except Exception as smi_error:
+        procfs_result = _detect_gpu_via_procfs()
+        if procfs_result is not None:
+            return procfs_result
         if required:
             raise RuntimeError(
-                "GPU detection via nvidia-smi failed: {}. Real runs must "
+                "GPU detection failed via both nvidia-smi ({}) and "
+                "/proc/driver/nvidia/gpus/*/information. Real runs must "
                 "execute on a GPU node inside the container; use --dry-run "
-                "to plan from elsewhere.".format(e)
-            ) from e
+                "to plan from elsewhere.".format(smi_error)
+            ) from smi_error
         return {"name": "UNKNOWN-GPU", "driver_version": "unknown",
                 "compute_cap": "unknown", "arch": "unknown"}
 
