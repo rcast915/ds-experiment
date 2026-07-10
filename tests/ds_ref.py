@@ -84,38 +84,68 @@ def ds_div(ah, al, bh, bl):
     substitution DsTransformPass.cpp's emitDsDiv makes -- see its comment
     for why a real hardware FMA can't be faithfully reproduced with
     separate ops.
+
+    KNOWN LIBRARY LIMITATION, kept as-is: t3 (the TwoProd/two_mul
+    residual of bh*t1) is computed and then never used -- t6 subtracts
+    t4 (bl*t1), not t3, matching the library's literal double_binary32_div
+    exactly. This is NOT limited to bl != 0 inputs: t3 captures t1's own
+    single-precision rounding error, so omitting it costs up to ~2^-23
+    relative error (f32-ULP level) on EVERY division through this
+    routine, including plain lo=0/lo=0 cases. See DsTransformPass.cpp's
+    emitDsDiv comment for the full derivation, confirmed against the
+    library's own sibling routine (used by sqrt) which correctly keeps
+    the equivalent term.
     """
     ah = np.float32(ah); al = np.float32(al)
     bh = np.float32(bh); bl = np.float32(bl)
     with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
         t1 = np.float32(ah / bh)
-        t2, t3 = two_prod(bh, t1)
+        t2, t3 = two_prod(bh, t1)   # t3 intentionally unused -- see docstring
         t4 = np.float32(bl * t1)
         t5 = np.float32(ah - t2)   # Sterbenz: exact
-        t6 = np.float32(al - t3)
+        t6 = np.float32(al - t4)
         t7 = np.float32(t5 + t6)
         t8 = np.float32(t7 / bh)
     return fast_two_sum(t1, t8)
 
 
+def ds_div_by_scalar(ah, al, b):
+    """Ported exactly from double-single-lib's
+    __double_binary_div_double_by_single -- divides a DS pair by a plain
+    scalar. Used only by ds_sqrt's internal refinement step.
+
+    NOT the same as ds_div(ah, al, b, 0.0): unlike double_binary32_div
+    (see ds_div's docstring), this routine correctly keeps the TwoProd
+    residual (t3) in its correction sum (t5 = al - t3) rather than
+    dropping it -- confirmed by reading the library source, this is a
+    genuine difference between the two routines, not two equivalent
+    formulations. ds_sqrt uses this one because that's what
+    double_binary32_sqrt actually calls.
+    """
+    ah = np.float32(ah); al = np.float32(al); b = np.float32(b)
+    with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
+        t1 = np.float32(ah / b)
+        t2, t3 = two_prod(b, t1)
+        t4 = np.float32(ah - t2)   # Sterbenz: exact
+        t5 = np.float32(al - t3)
+        t6 = np.float32(t4 + t5)
+        t7 = np.float32(t6 / b)
+    return fast_two_sum(t1, t7)
+
+
 def ds_sqrt(ah, al):
     """Ported exactly from double-single-lib's double_binary32_sqrt.
 
-    The library's __double_binary_div_double_by_single(ah, al, b) (divide
-    a DS pair by a plain scalar) is exactly ds_div(ah, al, b, 0.0) -- with
-    bl fixed at 0, ds_div's `t4 = bl * t1` term is identically 0 and drops
-    out of the sum, leaving the same sequence. Reused directly here
-    rather than duplicated, matching DsTransformPass.cpp's emitDsSqrt.
-
     Edge semantics not special-cased, matching the library: ah < 0 gives
     t1 = sqrt(ah) = NaN, propagating to (NaN, NaN). ah == 0 gives t1 = 0,
-    which then feeds ds_div as bh = 0, whose first division 0/0 is NaN
-    immediately -- so ds_sqrt(0, 0) is also (NaN, NaN), not a clean zero.
+    which then feeds ds_div_by_scalar as b = 0, whose first division 0/0
+    is NaN immediately -- so ds_sqrt(0, 0) is also (NaN, NaN), not a
+    clean zero.
     """
     ah = np.float32(ah); al = np.float32(al)
     with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
         t1 = np.float32(np.sqrt(ah))
-        t2, t3 = ds_div(ah, al, t1, np.float32(0.0))
+        t2, t3 = ds_div_by_scalar(ah, al, t1)
         t4, t5 = two_sum(t1, t2)
         t6 = np.float32(t5 + t3)
         t7 = np.float32(0.5 * t4)

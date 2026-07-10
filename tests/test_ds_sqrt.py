@@ -10,9 +10,10 @@ double-single-lib's double_binary32_sqrt.
 
   Section 2 — MLIR Structural
     Confirms stablehlo.sqrt actually expands (op-kind presence), including
-    the reused emitDsDiv sub-sequence (see emitDsSqrt's comment on why
-    the library's scalar-divide helper is exactly emitDsDiv with a zero
-    lo operand, not a separate duplicated sequence).
+    the emitDsDivByScalar sub-sequence (double-single-lib's
+    __double_binary_div_double_by_single, ported as its own helper since
+    it is NOT algebraically the same as emitDsDiv called with a zero lo
+    operand -- see emitDsDivByScalar's comment in DsTransformPass.cpp).
 
   Section 3 — GPU Numerical
     a) Unit accuracy: sqrt through the plugin vs. f64 truth, on a vector
@@ -38,9 +39,9 @@ double-single-lib's double_binary32_sqrt.
        confirming passthrough truly bypasses the DS transformation.
     e) Edge semantics: negative input gives NaN (ordinary IEEE sqrt
        behavior, not a divergence). Exact-zero input ALSO gives NaN, not
-       a clean zero -- t1 = sqrtf(0) = 0 feeds emitDsDiv as b_hi = 0,
-       whose first division is 0/0 = NaN immediately. This is a real
-       divergence from naive expectations (sqrt(0) "should" be 0), a
+       a clean zero -- t1 = sqrtf(0) = 0 feeds emitDsDivByScalar as
+       b = 0, whose first division is 0/0 = NaN immediately. This is a
+       real divergence from naive expectations (sqrt(0) "should" be 0), a
        property of the reference library's own structure (verified
        against the C source), reported here rather than silently patched.
 
@@ -139,12 +140,12 @@ def run_numpy_tests():
           math.isnan(float(h) + float(l)), f"got ({h}, {l})")
 
     # ── edge semantics: exact zero -- NOT a clean zero ────────────────────────
-    # t1 = sqrtf(0) = 0 exactly, which then feeds emitDsDiv as b_hi = 0 --
-    # its first division, a_hi/b_hi = 0/0, is IEEE-754 NaN immediately.
+    # t1 = sqrtf(0) = 0 exactly, which then feeds ds_div_by_scalar as
+    # b = 0 -- its first division, ah/b = 0/0, is IEEE-754 NaN immediately.
     # Confirmed present in the reference C library too (not introduced by
     # this port): double_binary32_sqrt does not special-case a zero input.
     h, l = ds_ref.ds_sqrt(0.0, 0.0)
-    check("sqrt: sqrt(0) -> NaN (algorithm's own 0/0 from the reused div step, not a clean zero)",
+    check("sqrt: sqrt(0) -> NaN (algorithm's own 0/0 from the scalar-div step, not a clean zero)",
           math.isnan(float(h) + float(l)), f"got ({h}, {l})")
 
 
@@ -187,13 +188,13 @@ def run_structural_tests():
           r.stderr[:300] if r.returncode != 0 else "")
     n_sqrt = r.stdout.count("stablehlo.sqrt")
     check(f"sqrt: exactly 1 stablehlo.sqrt op survives (got {n_sqrt})", n_sqrt == 1,
-          "expected only t1=sqrtf(a_hi); the reused emitDsDiv sub-sequence "
+          "expected only t1=sqrtf(a_hi); the emitDsDivByScalar sub-sequence "
           "must not itself contain a sqrt")
     n_div = r.stdout.count("stablehlo.divide")
-    check(f"sqrt: expands to 2 stablehlo.divide ops via reused emitDsDiv (got {n_div})",
-          n_div == 2, "expected emitDsDiv's t1'=a_hi/b_hi and t8=t7/b_hi")
+    check(f"sqrt: expands to 2 stablehlo.divide ops via emitDsDivByScalar (got {n_div})",
+          n_div == 2, "expected emitDsDivByScalar's t1=a_hi/b and t7=t6/b")
     n_mul = r.stdout.count("stablehlo.multiply")
-    check(f"sqrt: multiply ops present (two_prod inside emitDsDiv + the two 0.5x scalings) (got {n_mul})",
+    check(f"sqrt: multiply ops present (two_prod inside emitDsDivByScalar + the two 0.5x scalings) (got {n_mul})",
           n_mul > 3)
 
 
@@ -307,7 +308,7 @@ def run_gpu_tests():
     check("sqrt(-4) through plugin: NaN (ordinary IEEE sqrt behavior)",
           math.isnan(neg_sqrt), f"got {neg_sqrt}")
 
-    # Same divergence as Section 1: sqrt(0) -> NaN via the reused div
+    # Same divergence as Section 1: sqrt(0) -> NaN via the emitDsDivByScalar
     # step's 0/0, not a clean zero -- EXCEPT under passthrough, where
     # emitDsSqrt never runs at all, so the op is plain hardware sqrtf
     # and 0.0 is the correct answer there.
@@ -316,7 +317,7 @@ def run_gpu_tests():
         check("sqrt(0) through plugin (passthrough): 0.0 (plain IEEE, DS transform bypassed)",
               zero_sqrt == 0.0, f"got {zero_sqrt}")
     else:
-        check("sqrt(0) through plugin: NaN (algorithm's own 0/0 from the reused div step)",
+        check("sqrt(0) through plugin: NaN (algorithm's own 0/0 from the scalar-div step)",
               math.isnan(zero_sqrt), f"got {zero_sqrt}")
 
 

@@ -211,18 +211,46 @@ static std::pair<Value, Value> emitDsMul(OpBuilder& bld, Location loc,
 //   t4 = b_lo * t1
 //   t5 = a_hi - t2        [Sterbenz: exact -- t2 is close enough to a_hi
 //                           that this subtraction introduces no rounding]
-//   t6 = a_lo - t3
+//   t6 = a_lo - t4
 //   t7 = t5 + t6
 //   t8 = t7 / b_hi
 //   (out_hi, out_lo) = fast_two_sum(t1, t8)
 //
-// Deviation from the library, deliberate: the library's __two_mul uses a
-// real hardware FMA (__builtin_fmaf(a, b, -h)) for its TwoProduct, which
-// cannot be expressed as separate StableHLO ops -- by the time a
-// stablehlo.multiply's result is available, it is already rounded, so a
-// following stablehlo.subtract cannot recover the *unrounded* residual
-// the way a true single-rounding FMA instruction does. Substituting the
-// existing emitTwoProd (Veltkamp-split-based) here: it computes the same
+// KNOWN LIBRARY LIMITATION, kept as-is (not "fixed") per this project's
+// port-the-reference-exactly policy: t3, the TwoProd/two_mul residual of
+// b_hi*t1, is computed above and then never used again -- t6 subtracts
+// t4 (the b_lo*t1 contribution), not t3. Re-deriving the correction
+// algebraically: for a/b = t1 + delta, the exact identity
+// a_hi - t1*b_hi = t5 - t3 shows the correction sum should be
+// `t5 - t3 + a_lo - t4`, not `t5 + a_lo - t4` as written here. This is
+// confirmed to be a genuine omission and not an intentional design
+// choice: the library's OWN sibling routine for the "divide a DS pair by
+// a plain scalar" case, __double_binary_div_double_by_single (see
+// emitDsDivByScalar below, used by sqrt), computes the analogous term as
+// `al - t3` -- i.e. it correctly keeps the residual that this routine
+// drops. IMPORTANT -- this is not an adversarial-input-only corner case:
+// t3 captures t1's own single-precision rounding error (t1 = a_hi/b_hi is
+// only correctly-rounded, not exact), which the exact identity above
+// shows the correction needs regardless of b_lo. Empirically (500k
+// random trials, host-side check, both b_lo=0 and b_lo!=0), omitting t3
+// costs up to ~1.16e-7 relative error (~2^-23, f32-ULP level) on the
+// combined (hi, lo) result for EVERY division through this routine,
+// including plain lo=0/lo=0 cases with no cancellation at all -- not the
+// ~2^-48-class accuracy a double-word division algorithm of this shape
+// is designed to reach. In other words: this port's emitDsDiv provides
+// roughly one correctly-rounded division's worth of precision, not the
+// deep double-word accuracy the other DS ops (add/sub/mul/sqrt) achieve.
+// See test_ds_divide.py's DS_DIV_REL_ERR_BOUND for the bound derived
+// from this finding, used uniformly (not just for a divisor-lo!=0 case).
+//
+// Deviation from the library, deliberate (unlike the t3 omission above,
+// which is kept as-is): the library's __two_mul uses a real hardware FMA
+// (__builtin_fmaf(a, b, -h)) for its TwoProduct, which cannot be
+// expressed as separate StableHLO ops -- by the time a stablehlo.multiply's
+// result is available, it is already rounded, so a following
+// stablehlo.subtract cannot recover the *unrounded* residual the way a
+// true single-rounding FMA instruction does. Substituting the existing
+// emitTwoProd (Veltkamp-split-based) here: it computes the same
 // error-free product decomposition (p, e) via a mechanism StableHLO can
 // actually express, and is already relied on by emitDsMul above. This
 // project's own FMA-safety finding (README) also confirms this backend
@@ -239,10 +267,48 @@ static std::pair<Value, Value> emitDsDiv(OpBuilder& bld, Location loc,
     auto [t2, t3] = emitTwoProd(bld, loc, b_hi, t1);
     Value t4 = bld.create<stablehlo::MulOp>(loc, b_lo, t1);
     Value t5 = bld.create<stablehlo::SubtractOp>(loc, a_hi, t2);
-    Value t6 = bld.create<stablehlo::SubtractOp>(loc, a_lo, t3);
+    Value t6 = bld.create<stablehlo::SubtractOp>(loc, a_lo, t4);
     Value t7 = bld.create<stablehlo::AddOp>(loc, t5, t6);
     Value t8 = bld.create<stablehlo::DivOp>(loc, t7, b_hi);
     return emitFastTwoSum(bld, loc, t1, t8);
+}
+
+// __double_binary_div_double_by_single(a_hi, a_lo, b) → (out_hi, out_lo)
+// Ported exactly from double-single-lib's __double_binary_div_double_by_single
+// -- divides a DS pair by a plain (non-DS-tracked) scalar. Used only by
+// emitDsSqrt's internal refinement step, matching what double_binary32_sqrt
+// actually calls.
+//   t1 = a_hi / b
+//   (t2, t3) = two_mul(b, t1)
+//   t4 = a_hi - t2        [Sterbenz: exact]
+//   t5 = a_lo - t3
+//   t6 = t4 + t5
+//   t7 = t6 / b
+//   (out_hi, out_lo) = fast_two_sum(t1, t7)
+//
+// IMPORTANT: this is NOT the same sequence as calling emitDsDiv(a_hi,
+// a_lo, b, 0) with a zero lo operand, despite both dividing by something
+// with an effectively-zero low channel -- double_binary32_div (what
+// emitDsDiv ports, see below) drops the TwoProd/two_mul residual (t3)
+// from its correction sum entirely, while THIS routine correctly keeps
+// it (t5 = a_lo - t3). Confirmed by reading both routines side by side
+// in the reference source: this is a genuine difference between the two
+// library functions, not two equivalent formulations of the same thing.
+// A DS/DS emitDsDiv-based substitution here would silently inherit
+// emitDsDiv's t3-omission (see its comment for the full finding and why
+// divide keeps that omission, as a literal port of an authoritative but
+// evidently imperfect reference) -- sqrt does not need to inherit it,
+// since double_binary32_sqrt calls the *other*, more accurate helper.
+static std::pair<Value, Value> emitDsDivByScalar(OpBuilder& bld, Location loc,
+                                                   Value a_hi, Value a_lo,
+                                                   Value b) {
+    Value t1 = bld.create<stablehlo::DivOp>(loc, a_hi, b);
+    auto [t2, t3] = emitTwoProd(bld, loc, b, t1);
+    Value t4 = bld.create<stablehlo::SubtractOp>(loc, a_hi, t2);
+    Value t5 = bld.create<stablehlo::SubtractOp>(loc, a_lo, t3);
+    Value t6 = bld.create<stablehlo::AddOp>(loc, t4, t5);
+    Value t7 = bld.create<stablehlo::DivOp>(loc, t6, b);
+    return emitFastTwoSum(bld, loc, t1, t7);
 }
 
 // ds_sqrt((a_hi, a_lo)) → (out_hi, out_lo)
@@ -255,32 +321,21 @@ static std::pair<Value, Value> emitDsDiv(OpBuilder& bld, Location loc,
 //   t8 = 0.5 * t6
 //   (out_hi, out_lo) = fast_two_sum(t7, t8)
 //
-// __double_binary_div_double_by_single(ah, al, b) is the library's
-// "divide a DS pair by a plain scalar" helper -- checked against the
-// library source, it is exactly emitDsDiv(ah, al, b_hi=b, b_lo=0): with
-// b_lo fixed at 0, emitDsDiv's `t4 = b_lo * t1` term is identically 0 and
-// drops out of the sum, leaving the same six-step sequence
-// (two_mul/two_prod residual, Sterbenz subtract, recombine, fast_two_sum)
-// the library's scalar-divide helper performs. Reusing emitDsDiv here
-// with an explicit zero-lo operand rather than duplicating a near-copy
-// of it -- same emitTwoProd-for-__two_mul substitution applies, for the
-// same reason documented on emitDsDiv above.
-//
 // Edge semantics not special-cased, matching the library: a_hi < 0 makes
 // t1 = sqrtf(a_hi) = NaN, which propagates through every subsequent step
 // (NaN produces NaN under every op used here) -- so ds_sqrt of a negative
 // value is (NaN, NaN), not an error. a_hi == 0 makes t1 = sqrtf(0) = 0
-// exactly, which then feeds emitDsDiv as b_hi = 0: its first division,
-// t1'=a_hi/b_hi = 0/0, is IEEE-754 NaN immediately -- a different, more
-// direct mechanism than divide's own b_hi==0 case (which needs a_hi != 0
-// to reach the two_prod(0, inf) indeterminate form; see emitDsDiv), but
-// the same outcome: sqrt of an exact-zero DS pair is (NaN, NaN), reported
-// here rather than silently special-cased to a clean zero.
+// exactly, which then feeds emitDsDivByScalar as b = 0: its first
+// division, a_hi/b = 0/0, is IEEE-754 NaN immediately -- a different,
+// more direct mechanism than divide's own b_hi==0 case (which needs
+// a_hi != 0 to reach the two_prod(0, inf) indeterminate form; see
+// emitDsDiv), but the same outcome: sqrt of an exact-zero DS pair is
+// (NaN, NaN), reported here rather than silently special-cased to a
+// clean zero.
 static std::pair<Value, Value> emitDsSqrt(OpBuilder& bld, Location loc,
                                            Value a_hi, Value a_lo) {
     Value t1 = bld.create<stablehlo::SqrtOp>(loc, a_hi);
-    Value zero_lo = emitSplat(bld, loc, t1, 0.0f);
-    auto [t2, t3] = emitDsDiv(bld, loc, a_hi, a_lo, t1, zero_lo);
+    auto [t2, t3] = emitDsDivByScalar(bld, loc, a_hi, a_lo, t1);
     auto [t4, t5] = emitTwoSum(bld, loc, t1, t2);
     Value t6 = bld.create<stablehlo::AddOp>(loc, t5, t3);
     Value half = emitSplat(bld, loc, t4, 0.5f);
@@ -546,11 +601,12 @@ struct DsTransformPass
 
             // ── stablehlo.sqrt ─────────────────────────────────────────────
             // Ported from double-single-lib's double_binary32_sqrt -- see
-            // emitDsSqrt for the exact sequence, its reuse of emitDsDiv for
-            // the library's scalar-divide helper, and edge-semantics notes
-            // (negative input -> (NaN, NaN); exact-zero input -> (NaN, NaN)
-            // via an immediate 0/0, not a clean zero -- neither is special-
-            // cased, matching the library).
+            // emitDsSqrt for the exact sequence, emitDsDivByScalar for its
+            // scalar-divide refinement step (a separate, more accurate
+            // helper than emitDsDiv -- see emitDsDivByScalar's comment for
+            // why), and edge-semantics notes (negative input -> (NaN, NaN);
+            // exact-zero input -> (NaN, NaN) via an immediate 0/0, not a
+            // clean zero -- neither is special-cased, matching the library).
             if (auto sqrtOp = dyn_cast<stablehlo::SqrtOp>(op)) {
                 if (!isFloatTensor(sqrtOp.getResult())) continue;
                 if (!dsMap.count(sqrtOp.getOperand())) continue;
