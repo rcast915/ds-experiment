@@ -98,6 +98,31 @@ def ds_div(ah, al, bh, bl):
     return fast_two_sum(t1, t8)
 
 
+def ds_sqrt(ah, al):
+    """Ported exactly from double-single-lib's double_binary32_sqrt.
+
+    The library's __double_binary_div_double_by_single(ah, al, b) (divide
+    a DS pair by a plain scalar) is exactly ds_div(ah, al, b, 0.0) -- with
+    bl fixed at 0, ds_div's `t4 = bl * t1` term is identically 0 and drops
+    out of the sum, leaving the same sequence. Reused directly here
+    rather than duplicated, matching DsTransformPass.cpp's emitDsSqrt.
+
+    Edge semantics not special-cased, matching the library: ah < 0 gives
+    t1 = sqrt(ah) = NaN, propagating to (NaN, NaN). ah == 0 gives t1 = 0,
+    which then feeds ds_div as bh = 0, whose first division 0/0 is NaN
+    immediately -- so ds_sqrt(0, 0) is also (NaN, NaN), not a clean zero.
+    """
+    ah = np.float32(ah); al = np.float32(al)
+    with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
+        t1 = np.float32(np.sqrt(ah))
+        t2, t3 = ds_div(ah, al, t1, np.float32(0.0))
+        t4, t5 = two_sum(t1, t2)
+        t6 = np.float32(t5 + t3)
+        t7 = np.float32(0.5 * t4)
+        t8 = np.float32(0.5 * t6)
+    return fast_two_sum(t7, t8)
+
+
 # ── Trivial / comparison ops (ported from double-single-lib) ───────────────────
 #
 # Mirrors DsTransformPass.cpp's emitDsAbs/emitDsCompare, which were ported

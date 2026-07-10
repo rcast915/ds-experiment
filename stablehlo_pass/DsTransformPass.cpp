@@ -15,6 +15,7 @@
 //   stablehlo.subtract  → ds_sub
 //   stablehlo.multiply  → ds_mul  (two_prod + two_sum sequences)
 //   stablehlo.divide    → ds_div  (ported from double_binary32_div)
+//   stablehlo.sqrt      → ds_sqrt (ported from double_binary32_sqrt)
 //   stablehlo.negate    → ds_negate (negate both components)
 //   stablehlo.abs       → ds_abs  (conditional negate, ported from
 //                         double-single-lib's double_binary32_fabs)
@@ -25,18 +26,17 @@
 //   func entry args     → split into (hi, lo) via emitFromFloat
 //   func return values  → recombined via emitToFloat
 //
-// Ops in this table other than add/sub/mul/div/negate/abs/compare/select/
-// maximum/minimum, dot_general, and reduce are NOT DS-transformed: a
-// DS-tracked operand flowing into one of them silently reverts to native
-// f32 precision from that point on. Set DS_WARN_UNSUPPORTED=1 to have the
-// pass report these to stderr as they're encountered (op name + location);
-// default behavior (unset) is unchanged.
+// Ops in this table other than add/sub/mul/div/sqrt/negate/abs/compare/
+// select/maximum/minimum, dot_general, and reduce are NOT DS-transformed:
+// a DS-tracked operand flowing into one of them silently reverts to
+// native f32 precision from that point on. Set DS_WARN_UNSUPPORTED=1 to
+// have the pass report these to stderr as they're encountered (op name +
+// location); default behavior (unset) is unchanged.
 //
-// negate/abs/compare/divide ported from
+// negate/abs/compare/divide/sqrt ported from
 // double_single_ray/llvm-accuracy-analysis-k-test/double-single-lib
-// (double_binary32_neg/fabs/compare/div) -- see that library for the
-// authoritative reference and handoff.md for port notes. sqrt is ported
-// from the same library in a later change, not this one. The library's
+// (double_binary32_neg/fabs/compare/div/sqrt) -- see that library for the
+// authoritative reference and handoff.md for port notes. The library's
 // __two_mul (FMA-based) is not used as-is for divide/sqrt -- see
 // emitDsDiv's comment for why, and what's substituted instead.
 //
@@ -243,6 +243,50 @@ static std::pair<Value, Value> emitDsDiv(OpBuilder& bld, Location loc,
     Value t7 = bld.create<stablehlo::AddOp>(loc, t5, t6);
     Value t8 = bld.create<stablehlo::DivOp>(loc, t7, b_hi);
     return emitFastTwoSum(bld, loc, t1, t8);
+}
+
+// ds_sqrt((a_hi, a_lo)) → (out_hi, out_lo)
+// Ported exactly from double-single-lib's double_binary32_sqrt:
+//   t1 = sqrtf(a_hi)
+//   (t2, t3) = __double_binary_div_double_by_single(a_hi, a_lo, t1)
+//   (t4, t5) = two_sum(t1, t2)
+//   t6 = t5 + t3
+//   t7 = 0.5 * t4
+//   t8 = 0.5 * t6
+//   (out_hi, out_lo) = fast_two_sum(t7, t8)
+//
+// __double_binary_div_double_by_single(ah, al, b) is the library's
+// "divide a DS pair by a plain scalar" helper -- checked against the
+// library source, it is exactly emitDsDiv(ah, al, b_hi=b, b_lo=0): with
+// b_lo fixed at 0, emitDsDiv's `t4 = b_lo * t1` term is identically 0 and
+// drops out of the sum, leaving the same six-step sequence
+// (two_mul/two_prod residual, Sterbenz subtract, recombine, fast_two_sum)
+// the library's scalar-divide helper performs. Reusing emitDsDiv here
+// with an explicit zero-lo operand rather than duplicating a near-copy
+// of it -- same emitTwoProd-for-__two_mul substitution applies, for the
+// same reason documented on emitDsDiv above.
+//
+// Edge semantics not special-cased, matching the library: a_hi < 0 makes
+// t1 = sqrtf(a_hi) = NaN, which propagates through every subsequent step
+// (NaN produces NaN under every op used here) -- so ds_sqrt of a negative
+// value is (NaN, NaN), not an error. a_hi == 0 makes t1 = sqrtf(0) = 0
+// exactly, which then feeds emitDsDiv as b_hi = 0: its first division,
+// t1'=a_hi/b_hi = 0/0, is IEEE-754 NaN immediately -- a different, more
+// direct mechanism than divide's own b_hi==0 case (which needs a_hi != 0
+// to reach the two_prod(0, inf) indeterminate form; see emitDsDiv), but
+// the same outcome: sqrt of an exact-zero DS pair is (NaN, NaN), reported
+// here rather than silently special-cased to a clean zero.
+static std::pair<Value, Value> emitDsSqrt(OpBuilder& bld, Location loc,
+                                           Value a_hi, Value a_lo) {
+    Value t1 = bld.create<stablehlo::SqrtOp>(loc, a_hi);
+    Value zero_lo = emitSplat(bld, loc, t1, 0.0f);
+    auto [t2, t3] = emitDsDiv(bld, loc, a_hi, a_lo, t1, zero_lo);
+    auto [t4, t5] = emitTwoSum(bld, loc, t1, t2);
+    Value t6 = bld.create<stablehlo::AddOp>(loc, t5, t3);
+    Value half = emitSplat(bld, loc, t4, 0.5f);
+    Value t7 = bld.create<stablehlo::MulOp>(loc, half, t4);
+    Value t8 = bld.create<stablehlo::MulOp>(loc, half, t6);
+    return emitFastTwoSum(bld, loc, t7, t8);
 }
 
 // ds_abs((a_hi, a_lo)) → (out_hi, out_lo)
@@ -496,6 +540,24 @@ struct DsTransformPass
                 auto [b_hi, b_lo] = dsMap[divOp.getRhs()];
                 auto [r_hi, r_lo] = emitDsDiv(b, loc, a_hi, a_lo, b_hi, b_lo);
                 dsMap[divOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.sqrt ─────────────────────────────────────────────
+            // Ported from double-single-lib's double_binary32_sqrt -- see
+            // emitDsSqrt for the exact sequence, its reuse of emitDsDiv for
+            // the library's scalar-divide helper, and edge-semantics notes
+            // (negative input -> (NaN, NaN); exact-zero input -> (NaN, NaN)
+            // via an immediate 0/0, not a clean zero -- neither is special-
+            // cased, matching the library).
+            if (auto sqrtOp = dyn_cast<stablehlo::SqrtOp>(op)) {
+                if (!isFloatTensor(sqrtOp.getResult())) continue;
+                if (!dsMap.count(sqrtOp.getOperand())) continue;
+
+                auto [a_hi, a_lo] = dsMap[sqrtOp.getOperand()];
+                auto [r_hi, r_lo] = emitDsSqrt(b, loc, a_hi, a_lo);
+                dsMap[sqrtOp.getResult()] = {r_hi, r_lo};
                 toErase.push_back(op);
                 continue;
             }
