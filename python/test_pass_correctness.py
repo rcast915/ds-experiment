@@ -47,7 +47,7 @@ def run_pass(fn, *args):
         f.write(mlir_text)
     r = subprocess.run(
         ['./stablehlo_pass/build/mlir-ds-opt',
-         '--pass-pipeline=builtin.module(func.func(ds-transform))',
+         '--pass-pipeline=builtin.module(inline,func.func(ds-transform))',
          '/tmp/_test.mlir'],
         capture_output=True, text=True, cwd='/src/ds_experiment'
     )

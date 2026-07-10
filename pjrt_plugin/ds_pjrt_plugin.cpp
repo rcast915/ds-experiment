@@ -73,10 +73,24 @@ static PJRT_Error* ds_compile_wrapper(PJRT_Client_Compile_Args* args) {
     in_file.close();
 
     // 2. Determine pipeline
+    //
+    // `inline` runs before ds-transform (inline pass only -- FFI pass
+    // pipeline intentionally left untouched, out of scope here): JAX
+    // outlines some primitives (confirmed: jnp.where) into a separate
+    // private helper function called via func.call, rather than emitting
+    // an inline stablehlo.select. DsTransformPass runs per-func.func and
+    // has no func.call handler, so a DS-tracked value crossing such a call
+    // boundary loses its (hi, lo) pairing -- the callee re-splits its own
+    // arguments as fresh (v, 0) entry points, silently discarding the
+    // caller's correction. Since mlir-ds-opt.cpp already calls
+    // registerAllPasses(), MLIR's generic inliner is already available;
+    // running it first eliminates these call boundaries before
+    // ds-transform ever sees them, rather than requiring ds-transform to
+    // understand call/return itself.
     const char* binary = use_ffi_pass() ? DS_FFI_OPT_BINARY : DS_OPT_BINARY;
     const char* pipeline = use_ffi_pass() ?
         "builtin.module(vhlo-to-version{target=1.16.3},vhlo-legalize-to-stablehlo,func.func(ds-ffi-transform),stablehlo-legalize-to-vhlo)" :
-        "builtin.module(vhlo-to-version{target=1.16.3},vhlo-legalize-to-stablehlo,func.func(ds-transform),stablehlo-legalize-to-vhlo)";
+        "builtin.module(vhlo-to-version{target=1.16.3},vhlo-legalize-to-stablehlo,inline,func.func(ds-transform),stablehlo-legalize-to-vhlo)";
 
     // 3. Run transformation
     int rc = run_command(binary, pipeline, in_path, out_path);

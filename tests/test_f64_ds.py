@@ -174,7 +174,7 @@ def run_structural_tests():
             f.write(mlir_text)
         return subprocess.run(
             [str(OPT_BINARY),
-             "--pass-pipeline=builtin.module(func.func(ds-transform))",
+             "--pass-pipeline=builtin.module(inline,func.func(ds-transform))",
              tmp],
             capture_output=True, text=True, cwd=str(PROJECT_ROOT),
         )
