@@ -157,7 +157,13 @@ def extract_root_and_calls(entry_text):
     if not m:
         return None, None
     root_line = m.group(0)
-    calls_m = re.search(r'calls=%(\S+)', root_line)
+    # [\w.]+ (word chars + dot for numbered variants like "fused_add.1"),
+    # not \S+ -- the naive non-whitespace capture grabbed a trailing comma
+    # from "calls=%fused_add, metadata={...}" in practice (confirmed on a
+    # real H100 dump), which then never matched the real computation's
+    # definition line and silently fell back to the wrong (much shorter,
+    # arithmetic-free) extraction path instead of erroring loudly.
+    calls_m = re.search(r'calls=%([\w.]+)', root_line)
     return root_line, (calls_m.group(1) if calls_m else None)
 
 
@@ -247,10 +253,25 @@ def main():
 
     root_line, called_comp = extract_root_and_calls(entry_text)
 
-    body_text, body_source = None, None
+    body_text, body_source, extraction_warning = None, None, None
     if called_comp:
         body_text = extract_named_computation(after_text, called_comp)
-        body_source = "named computation %{}".format(called_comp)
+        if body_text:
+            body_source = "named computation %{}".format(called_comp)
+        else:
+            # ROOT explicitly named a called computation but we couldn't find
+            # its definition -- falling back to the inline slice below is a
+            # real degradation (that slice does not contain the epilogue
+            # computation's own body), not a normal/expected code path. Flag
+            # it loudly rather than silently reporting whatever the fallback
+            # finds as if it were equally reliable.
+            extraction_warning = (
+                "ROOT references calls=%{} but no matching computation definition "
+                "was found in the dump -- falling back to the inline-epilogue slice, "
+                "which does NOT contain that computation's body. Treat op counts and "
+                "verdict below with suspicion; this indicates an extraction bug, not "
+                "necessarily anything about the pass.".format(called_comp)
+            )
     if not body_text and root_line:
         body_text = extract_inline_epilogue(entry_text, root_line)
         body_source = "inline epilogue (textual slice from last GEMM producer to ROOT)"
@@ -258,6 +279,8 @@ def main():
     counts = count_ops(body_text) if body_text else {"adds": 0, "subtracts": 0, "converts": 0,
                                                        "slices_reshapes_bitcasts": 0}
     verdict = classify(counts) if body_text else "PARTIAL/OTHER (no body extracted)"
+    if extraction_warning:
+        verdict = "PARTIAL/OTHER (extraction failed, see extraction_warning)"
 
     pre_file, pre_method = find_pre_optimization_file(dump_dir, after_file)
     pre_check = None
@@ -282,10 +305,14 @@ def main():
         "body_text": body_text,
         "op_counts": counts,
         "verdict": verdict,
+        "extraction_warning": extraction_warning,
         "pre_optimization_check": pre_check,
     })
 
     common.write_json_atomic(out_path, result)
+    if extraction_warning:
+        print("[exp2b:{}] *** EXTRACTION WARNING: {} ***".format(args.precision, extraction_warning),
+              file=sys.stderr)
     print(
         "[exp2b:{}] verdict={} (subtracts={} adds={} converts={}); wrote {}".format(
             args.precision, verdict, counts["subtracts"], counts["adds"], counts["converts"], out_path),

@@ -231,6 +231,7 @@ def render_exp2b(results_dir):
     rows = ["| Precision | Verdict | Subtracts | Adds | Converts | Pre-opt module had subtracts? |",
             "|---|---|---|---|---|---|"]
     collapsed_modes = []
+    extraction_warnings = []
     for mode, doc in modes.items():
         if not doc:
             rows.append("| {} | NOT RUN | — | — | — | — |".format(mode))
@@ -242,10 +243,17 @@ def render_exp2b(results_dir):
         verdict = doc.get("verdict", "?")
         if str(verdict).startswith("COLLAPSED"):
             collapsed_modes.append(mode)
+        if doc.get("extraction_warning"):
+            extraction_warnings.append((mode, doc["extraction_warning"]))
         rows.append("| {} | **{}** | {} | {} | {} | {} |".format(
             mode, verdict, counts.get("subtracts", "?"), counts.get("adds", "?"),
             counts.get("converts", "?"), pre_str))
     lines.append("\n".join(rows) + "\n")
+
+    if extraction_warnings:
+        lines.append("**⚠ Extraction warning(s) -- verdict(s) above are not trustworthy as-is:**\n")
+        for mode, warning in extraction_warnings:
+            lines.append("- {}: {}\n".format(mode, warning))
 
     if collapsed_modes:
         lines.append(
