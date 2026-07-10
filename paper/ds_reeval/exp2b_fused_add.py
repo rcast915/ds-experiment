@@ -71,32 +71,57 @@ def dump_has_content(dump_dir):
     return os.path.isdir(dump_dir) and bool(glob.glob(os.path.join(dump_dir, "*.txt")))
 
 
-def _is_aux_file(path):
-    return "buffer-assignment" in path or "live-range" in path
+def _looks_like_hlo_module(text):
+    return bool(re.search(r'^\s*ENTRY\s+%', text, re.MULTILINE))
+
+
+def _read_if_hlo_module(path):
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError:
+        return None
+    return text if _looks_like_hlo_module(text) else None
 
 
 def find_after_optimizations_file(dump_dir):
+    # Match the filename *suffix* exactly ("...after_optimizations.txt",
+    # nothing after it) rather than a substring -- XLA emits auxiliary
+    # reports alongside the real dump whose names also contain
+    # "after_optimizations" as a substring but aren't HLO text at all
+    # (buffer-assignment, live-range, memory-usage-report, and there is no
+    # guarantee that list is complete across XLA versions -- e.g.
+    # "-memory-usage-report.txt" wasn't anticipated and broke an exact
+    # exclusion-list approach here). Content-verify too (must have an
+    # ENTRY block) rather than trusting the name alone.
     candidates = sorted(
         p for p in glob.glob(os.path.join(dump_dir, "*jit_fn*after_optimizations*.txt"))
-        if not _is_aux_file(p)
+        if p.endswith("after_optimizations.txt")
     )
+    for c in candidates:
+        if _read_if_hlo_module(c) is not None:
+            return c
     return candidates[0] if candidates else None
 
 
 def find_pre_optimization_file(dump_dir, after_file):
     candidates = sorted(
         p for p in glob.glob(os.path.join(dump_dir, "*jit_fn*before_optimizations*.txt"))
-        if not _is_aux_file(p)
+        if p.endswith("before_optimizations.txt")
     )
-    if candidates:
-        return candidates[0], "matched *before_optimizations*.txt"
+    for c in candidates:
+        if _read_if_hlo_module(c) is not None:
+            return c, "matched *before_optimizations.txt (exact suffix, content-verified)"
+    # Fallback: any other jit_fn module dump, content-verified as an actual
+    # HLO module (not an auxiliary report), preferring the lowest-numbered
+    # (earliest) one that isn't the after-optimizations file itself.
     all_jit_fn = sorted(
         p for p in glob.glob(os.path.join(dump_dir, "module_*jit_fn*.txt"))
-        if not _is_aux_file(p) and p != after_file
+        if p != after_file
     )
-    if all_jit_fn:
-        return all_jit_fn[0], "fallback: lowest-numbered jit_fn module dump other than after_optimizations"
-    return None, "no candidate found"
+    for c in all_jit_fn:
+        if _read_if_hlo_module(c) is not None:
+            return c, "fallback: lowest-numbered jit_fn module dump (content-verified) other than after_optimizations"
+    return None, "no HLO-module-shaped candidate found"
 
 
 def _extract_block(text, start_line_re):
