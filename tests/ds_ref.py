@@ -44,6 +44,18 @@ def two_prod(a, b):
     return p, np.float32(e)
 
 
+def fast_two_sum(a, b):
+    """Dekker's fast form -- REQUIRES |a| >= |b|. Ported from
+    double-single-lib's __fast_two_sum. 1 add + 2 subs, vs. two_sum's
+    general 1 add + 4 subs."""
+    a = np.float32(a); b = np.float32(b)
+    with np.errstate(invalid='ignore', over='ignore'):
+        h = a + b
+        t = h - a
+        l = b - t
+    return h, np.float32(l)
+
+
 # ── DS pair arithmetic ────────────────────────────────────────────────────────
 
 def ds_add(ah, al, bh, bl):
@@ -62,6 +74,28 @@ def ds_mul(ah, al, bh, bl):
     cross = np.float32(ah * bl + al * bh)
     s, e2 = two_sum(p1, cross)
     return s, np.float32(e1 + e2 + al * bl)
+
+
+def ds_div(ah, al, bh, bl):
+    """Ported exactly from double-single-lib's double_binary32_div.
+
+    __two_mul (the library's FMA-based TwoProduct) is substituted with
+    two_prod (Veltkamp-split-based) here too, matching the same
+    substitution DsTransformPass.cpp's emitDsDiv makes -- see its comment
+    for why a real hardware FMA can't be faithfully reproduced with
+    separate ops.
+    """
+    ah = np.float32(ah); al = np.float32(al)
+    bh = np.float32(bh); bl = np.float32(bl)
+    with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
+        t1 = np.float32(ah / bh)
+        t2, t3 = two_prod(bh, t1)
+        t4 = np.float32(bl * t1)
+        t5 = np.float32(ah - t2)   # Sterbenz: exact
+        t6 = np.float32(al - t3)
+        t7 = np.float32(t5 + t6)
+        t8 = np.float32(t7 / bh)
+    return fast_two_sum(t1, t8)
 
 
 # ── Trivial / comparison ops (ported from double-single-lib) ───────────────────

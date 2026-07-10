@@ -139,6 +139,7 @@ if [[ "$F64_ONLY" -eq 0 ]]; then
     run_test "Dot Product Accuracy (f32)" "test_dot_product.py"
     run_test "Matrix Multiply Accuracy (f32)" "test_matmul.py"
     run_test "Trivial/Comparison Ops (negate/abs/compare/select/max/min)" "test_ds_trivial_ops.py"
+    run_test "Divide Accuracy (f32)" "test_ds_divide.py"
 fi
 
 # f64 test needs JAX_ENABLE_X64=1 in the environment.

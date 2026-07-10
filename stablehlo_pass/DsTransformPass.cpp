@@ -14,6 +14,7 @@
 //   stablehlo.add       → ds_add  (two_sum sequences)
 //   stablehlo.subtract  → ds_sub
 //   stablehlo.multiply  → ds_mul  (two_prod + two_sum sequences)
+//   stablehlo.divide    → ds_div  (ported from double_binary32_div)
 //   stablehlo.negate    → ds_negate (negate both components)
 //   stablehlo.abs       → ds_abs  (conditional negate, ported from
 //                         double-single-lib's double_binary32_fabs)
@@ -24,18 +25,20 @@
 //   func entry args     → split into (hi, lo) via emitFromFloat
 //   func return values  → recombined via emitToFloat
 //
-// Ops in this table other than add/sub/mul/negate/abs/compare/select/
+// Ops in this table other than add/sub/mul/div/negate/abs/compare/select/
 // maximum/minimum, dot_general, and reduce are NOT DS-transformed: a
 // DS-tracked operand flowing into one of them silently reverts to native
 // f32 precision from that point on. Set DS_WARN_UNSUPPORTED=1 to have the
 // pass report these to stderr as they're encountered (op name + location);
 // default behavior (unset) is unchanged.
 //
-// negate/abs/compare ported from
+// negate/abs/compare/divide ported from
 // double_single_ray/llvm-accuracy-analysis-k-test/double-single-lib
-// (double_binary32_neg/fabs/compare) -- see that library for the
-// authoritative reference and handoff.md for port notes. divide and sqrt
-// are ported from the same library in a later change, not this one.
+// (double_binary32_neg/fabs/compare/div) -- see that library for the
+// authoritative reference and handoff.md for port notes. sqrt is ported
+// from the same library in a later change, not this one. The library's
+// __two_mul (FMA-based) is not used as-is for divide/sqrt -- see
+// emitDsDiv's comment for why, and what's substituted instead.
 //
 //===----------------------------------------------------------------------===//
 
@@ -104,6 +107,22 @@ static std::pair<Value, Value> emitTwoSum(OpBuilder& bld, Location loc,
                        bld.create<stablehlo::SubtractOp>(loc, s, bb)),
                    bld.create<stablehlo::SubtractOp>(loc, b, bb));
     return {s, e};
+}
+
+// fast_two_sum(a, b) → (hi, lo).  REQUIRES |a| >= |b| -- Dekker's fast
+// form (1 add + 2 subs, vs. two_sum's general 1 add + 4 subs). Ported
+// from double-single-lib's __fast_two_sum; used by divide/sqrt's final
+// combining steps, where the precondition holds by construction (the
+// leading term dominates the correction term).
+//   h = a + b
+//   t = h - a
+//   l = b - t
+static std::pair<Value, Value> emitFastTwoSum(OpBuilder& bld, Location loc,
+                                               Value a, Value b) {
+    Value h = bld.create<stablehlo::AddOp>(loc, a, b);
+    Value t = bld.create<stablehlo::SubtractOp>(loc, h, a);
+    Value l = bld.create<stablehlo::SubtractOp>(loc, b, t);
+    return {h, l};
 }
 
 // emitSplat: broadcast a scalar float constant to the shape of ref_val.
@@ -183,6 +202,47 @@ static std::pair<Value, Value> emitDsMul(OpBuilder& bld, Location loc,
                          bld.create<stablehlo::AddOp>(loc, e1, e2),
                          bld.create<stablehlo::MulOp>(loc, a_lo, b_lo));
     return {s, out_lo};
+}
+
+// ds_div((a_hi, a_lo), (b_hi, b_lo)) → (out_hi, out_lo)
+// Ported exactly from double-single-lib's double_binary32_div:
+//   t1 = a_hi / b_hi
+//   (t2, t3) = two_mul(b_hi, t1)
+//   t4 = b_lo * t1
+//   t5 = a_hi - t2        [Sterbenz: exact -- t2 is close enough to a_hi
+//                           that this subtraction introduces no rounding]
+//   t6 = a_lo - t3
+//   t7 = t5 + t6
+//   t8 = t7 / b_hi
+//   (out_hi, out_lo) = fast_two_sum(t1, t8)
+//
+// Deviation from the library, deliberate: the library's __two_mul uses a
+// real hardware FMA (__builtin_fmaf(a, b, -h)) for its TwoProduct, which
+// cannot be expressed as separate StableHLO ops -- by the time a
+// stablehlo.multiply's result is available, it is already rounded, so a
+// following stablehlo.subtract cannot recover the *unrounded* residual
+// the way a true single-rounding FMA instruction does. Substituting the
+// existing emitTwoProd (Veltkamp-split-based) here: it computes the same
+// error-free product decomposition (p, e) via a mechanism StableHLO can
+// actually express, and is already relied on by emitDsMul above. This
+// project's own FMA-safety finding (README) also confirms this backend
+// does not silently contract separate multiply+subtract StableHLO ops
+// into fma.rn.f32, so there's no risk of the Veltkamp sequence being
+// "helpfully" corrupted into something resembling the library's FMA path
+// (which would round differently) -- see also the note on Sterbenz-style
+// subtractions being an elevated-simplifier-risk sequence, same category
+// as the TwoSum residual chain Experiment 2b already checks.
+static std::pair<Value, Value> emitDsDiv(OpBuilder& bld, Location loc,
+                                          Value a_hi, Value a_lo,
+                                          Value b_hi, Value b_lo) {
+    Value t1 = bld.create<stablehlo::DivOp>(loc, a_hi, b_hi);
+    auto [t2, t3] = emitTwoProd(bld, loc, b_hi, t1);
+    Value t4 = bld.create<stablehlo::MulOp>(loc, b_lo, t1);
+    Value t5 = bld.create<stablehlo::SubtractOp>(loc, a_hi, t2);
+    Value t6 = bld.create<stablehlo::SubtractOp>(loc, a_lo, t3);
+    Value t7 = bld.create<stablehlo::AddOp>(loc, t5, t6);
+    Value t8 = bld.create<stablehlo::DivOp>(loc, t7, b_hi);
+    return emitFastTwoSum(bld, loc, t1, t8);
 }
 
 // ds_abs((a_hi, a_lo)) → (out_hi, out_lo)
@@ -410,6 +470,32 @@ struct DsTransformPass
                 auto [b_hi, b_lo] = dsMap[mulOp.getRhs()];
                 auto [r_hi, r_lo] = emitDsMul(b, loc, a_hi, a_lo, b_hi, b_lo);
                 dsMap[mulOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.divide ──────────────────────────────────────────
+            // Ported from double-single-lib's double_binary32_div -- see
+            // emitDsDiv for the exact sequence and the FMA/two_mul
+            // substitution note. No special-casing for b_hi == 0 or
+            // negative/NaN inputs -- the library doesn't special-case them
+            // either. Note this is NOT the same as plain a/b's IEEE
+            // propagation: b_hi == 0 makes t1 = a_hi/b_hi an infinity,
+            // and the algorithm's own two_prod(b_hi, t1) step then hits
+            // the IEEE-754 0*inf indeterminate form, so division by
+            // exactly zero yields NaN here, not a clean +inf. Confirmed
+            // this is a property of the reference library's own
+            // structure, not introduced by this port -- see
+            // tests/test_ds_divide.py's edge-semantics tests.
+            if (auto divOp = dyn_cast<stablehlo::DivOp>(op)) {
+                if (!isFloatTensor(divOp.getResult())) continue;
+                if (!dsMap.count(divOp.getLhs()) ||
+                    !dsMap.count(divOp.getRhs())) continue;
+
+                auto [a_hi, a_lo] = dsMap[divOp.getLhs()];
+                auto [b_hi, b_lo] = dsMap[divOp.getRhs()];
+                auto [r_hi, r_lo] = emitDsDiv(b, loc, a_hi, a_lo, b_hi, b_lo);
+                dsMap[divOp.getResult()] = {r_hi, r_lo};
                 toErase.push_back(op);
                 continue;
             }
