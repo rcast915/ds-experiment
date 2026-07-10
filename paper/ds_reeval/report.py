@@ -211,6 +211,60 @@ def render_exp2(results_dir):
     return "\n".join(lines)
 
 
+def render_exp2b(results_dir):
+    modes = {mode: load_json(results_dir / "exp2b_fused_add_{}.json".format(mode))
+             for mode in ["default", "highest"]}
+
+    lines = ["### Experiment 2b — Did the TwoSum correction survive XLA's optimizer?", ""]
+    if all(v is None for v in modes.values()):
+        return "\n".join(lines)  # not run -- omit the section entirely rather than clutter with "not run"
+
+    lines.append(
+        "Checks whether the DS pass's final `TwoSum(p, e1+e2+e3)` correction "
+        "(4 subtracts + 2 adds per call, see `emitTwoSum` in "
+        "`DsTransformPass.cpp`) survives in the matmul epilogue after XLA's "
+        "optimizer runs, or whether the algebraic simplifier folded the "
+        "subtract-based residual chain away (legal under real-number algebra, "
+        "not under float rounding).\n"
+    )
+
+    rows = ["| Precision | Verdict | Subtracts | Adds | Converts | Pre-opt module had subtracts? |",
+            "|---|---|---|---|---|---|"]
+    collapsed_modes = []
+    for mode, doc in modes.items():
+        if not doc:
+            rows.append("| {} | NOT RUN | — | — | — | — |".format(mode))
+            continue
+        counts = doc.get("op_counts", {})
+        pre = doc.get("pre_optimization_check")
+        pre_str = "{} (whole pre-opt module)".format(
+            pre["subtract_count_in_whole_module"]) if pre else "not found"
+        verdict = doc.get("verdict", "?")
+        if str(verdict).startswith("COLLAPSED"):
+            collapsed_modes.append(mode)
+        rows.append("| {} | **{}** | {} | {} | {} | {} |".format(
+            mode, verdict, counts.get("subtracts", "?"), counts.get("adds", "?"),
+            counts.get("converts", "?"), pre_str))
+    lines.append("\n".join(rows) + "\n")
+
+    if collapsed_modes:
+        lines.append(
+            "**⚠ COLLAPSED on: {}** -- the DS correction may be silently "
+            "discarded on this path. This changes what the paper can claim "
+            "about that precision mode; see the body below and "
+            "`results/<gpu>/exp2b_fused_add_*.json`.\n".format(", ".join(collapsed_modes))
+        )
+
+    for mode, doc in modes.items():
+        if doc and doc.get("body_text"):
+            lines.append("<details><summary>{}: extracted epilogue body ({})</summary>\n".format(
+                mode, doc.get("body_source", "?")))
+            lines.append("```")
+            lines.append(doc["body_text"])
+            lines.append("```\n</details>\n")
+    return "\n".join(lines)
+
+
 def render_exp3(results_dir):
     standard = load_json(results_dir / "exp3_pair_accuracy_standard.json")
     pairs = load_json(results_dir / "exp3_pair_accuracy_pairs.json")
@@ -321,6 +375,7 @@ def main():
         exp1_md, headline_highest = render_exp1(gpu_tag, gdir)
         out.append(exp1_md)
         out.append(render_exp2(gdir))
+        out.append(render_exp2b(gdir))
         exp3_md, exp3_verdict = render_exp3(gdir)
         out.append(exp3_md)
         summary_rows.append((gpu_tag, headline_highest, exp3_verdict))
