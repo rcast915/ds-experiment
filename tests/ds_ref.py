@@ -77,7 +77,8 @@ def ds_mul(ah, al, bh, bl):
 
 
 def ds_div(ah, al, bh, bl):
-    """Ported exactly from double-single-lib's double_binary32_div.
+    """Based on double-single-lib's double_binary32_div, WITH ONE
+    DELIBERATE CORRECTION to a confirmed bug in the reference.
 
     __two_mul (the library's FMA-based TwoProduct) is substituted with
     two_prod (Veltkamp-split-based) here too, matching the same
@@ -85,26 +86,28 @@ def ds_div(ah, al, bh, bl):
     for why a real hardware FMA can't be faithfully reproduced with
     separate ops.
 
-    KNOWN LIBRARY LIMITATION, kept as-is: t3 (the TwoProd/two_mul
-    residual of bh*t1) is computed and then never used -- t6 subtracts
-    t4 (bl*t1), not t3, matching the library's literal double_binary32_div
-    exactly. This is NOT limited to bl != 0 inputs: t3 captures t1's own
-    single-precision rounding error, so omitting it costs up to ~2^-23
-    relative error (f32-ULP level) on EVERY division through this
-    routine, including plain lo=0/lo=0 cases. See DsTransformPass.cpp's
-    emitDsDiv comment for the full derivation, confirmed against the
-    library's own sibling routine (used by sqrt) which correctly keeps
-    the equivalent term.
+    DEVIATION FROM THE LIBRARY, deliberate: as literally written,
+    double_binary32_div computes t7 = t5 + t6, never using t3 (the
+    TwoProd/two_mul residual of bh*t1) again after computing it. This is
+    a confirmed bug, not an intentional design choice (the library's own
+    sibling routine for DS-by-scalar division keeps the equivalent term
+    correctly -- see DsTransformPass.cpp's emitDsDiv comment for the full
+    derivation and empirical confirmation, including why it's not limited
+    to bl != 0 inputs). t7 here includes the `- t3` correction, restoring
+    the ~2^-48-class double-word accuracy this algorithm's structure is
+    designed to reach (confirmed empirically: worst case ~1.7e-14 over
+    500k random trials) instead of the ~2^-23-class (f32-ULP-level)
+    accuracy the literal library formula achieves.
     """
     ah = np.float32(ah); al = np.float32(al)
     bh = np.float32(bh); bl = np.float32(bl)
     with np.errstate(invalid='ignore', over='ignore', divide='ignore'):
         t1 = np.float32(ah / bh)
-        t2, t3 = two_prod(bh, t1)   # t3 intentionally unused -- see docstring
+        t2, t3 = two_prod(bh, t1)
         t4 = np.float32(bl * t1)
         t5 = np.float32(ah - t2)   # Sterbenz: exact
         t6 = np.float32(al - t4)
-        t7 = np.float32(t5 + t6)
+        t7 = np.float32(np.float32(t5 + t6) - t3)   # correction: see docstring
         t8 = np.float32(t7 / bh)
     return fast_two_sum(t1, t8)
 

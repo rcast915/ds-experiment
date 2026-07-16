@@ -1,6 +1,6 @@
 """
-Accuracy tests for DS divide (stablehlo.divide -> emitDsDiv), ported from
-double-single-lib's double_binary32_div.
+Accuracy tests for DS divide (stablehlo.divide -> emitDsDiv), based on
+double-single-lib's double_binary32_div WITH ONE DELIBERATE CORRECTION.
 
   Section 1 — NumPy Reference
     Validates ds_ref.ds_div against f64 ground truth across varied
@@ -8,32 +8,36 @@ double-single-lib's double_binary32_div.
     the lo=0 degenerate case (plain f32 inputs) still gives a correct
     result, not just an efficient one.
 
-    KNOWN LIBRARY LIMITATION (kept as-is, not "fixed" -- see ds_ref.ds_div's
-    docstring and DsTransformPass.cpp's emitDsDiv comment for the full
-    derivation): double_binary32_div drops the TwoProd/two_mul residual
-    (t3) from its correction sum. Originally assumed this only mattered
-    when the divisor's lo channel is non-zero -- confirmed EMPIRICALLY
-    WRONG: t3 captures t1's own single-precision rounding error (via the
-    exact identity a_hi - b_hi*t1 = t5 - t3), so it matters regardless of
-    b_lo. Every case below, including plain lo=0/lo=0 divisions with no
-    cancellation at all, is limited to ~2^-24-class (f32-ULP-level)
-    accuracy on the combined (hi, lo) result -- NOT the ~2^-48-class
-    double-word accuracy the algorithm's overall structure suggests.
-    DS_DIV_REL_ERR_BOUND reflects this real, universal limit, not the
-    inapplicable double-word assumption used for other DS ops (add/sub/
-    mul/sqrt, none of which drop a term this way).
+    CORRECTED LIBRARY BUG (see ds_ref.ds_div's docstring and
+    DsTransformPass.cpp's emitDsDiv comment for the full derivation):
+    double_binary32_div, as literally written, drops the TwoProd/two_mul
+    residual (t3) from its correction sum -- confirmed to be a genuine
+    bug (not a design choice) via the library's own sibling routine,
+    which keeps the equivalent term. This is not limited to a non-zero
+    divisor lo: t3 captures t1's own single-precision rounding error, so
+    it matters for every division, including plain lo=0/lo=0 cases with
+    no cancellation at all. This port includes the `-t3` term, restoring
+    ~2^-48-class double-word accuracy (confirmed empirically: worst case
+    ~1.7e-14 over 500k random trials) instead of the ~2^-23-class
+    (f32-ULP-level) accuracy the literal library formula achieves.
+    DS_DIV_REL_ERR_BOUND reflects this corrected, deep accuracy -- the
+    same double-word class the other DS ops (add/sub/mul/sqrt) achieve.
 
   Section 2 — MLIR Structural
     Confirms stablehlo.divide actually expands (op-kind presence).
 
   Section 3 — GPU Numerical
-    a) Unit accuracy: DS divide through the plugin vs. f64 truth. Uses
-       the same DS_DIV_REL_ERR_BOUND as Section 1 -- both the observable
-       f32-quantized-at-return limit ("correctly rounded f32" can't be
-       beaten for an isolated lo=0 division, see prior note in this
-       docstring's history) and the internal t3-omission limit land in
-       the same ~2^-24-ish ballpark for this op, so one bound covers both
-       here.
+    a) Unit accuracy: DS divide through the plugin vs. f64 truth, on a
+       vector of plain f32 (lo=0) inputs. Because the function returns a
+       single f32 (quantized at func.return) and plain f32 division is
+       already IEEE correctly-rounded, an isolated lo=0 division cannot
+       observably beat plain f32 -- unrelated to and unchanged by the t3
+       fix (that fix restores divide's *internal* accuracy; it can't make
+       an already-correctly-rounded single f32 result any more correct).
+       The bound here reflects "correctly rounded f32" (~2^-22 with
+       margin), not DS_DIV_REL_ERR_BOUND -- DS's real, measurable
+       advantage is checked in (b)/(c) and Section 1's lo != 0
+       cross-check, where the corrected internal accuracy is observable.
     b) Pair-accuracy variant (DS_RETURN_PAIRS=1): per Experiment 3's
        observable-vs-internal distinction, checks the *internal* (hi, lo)
        pair recombined in f64 on the host separately from the f32-return-
@@ -73,18 +77,21 @@ import ds_ref
 OPT_BINARY = PROJECT_ROOT / "stablehlo_pass" / "build" / "mlir-ds-opt"
 PLUGIN_SO = PROJECT_ROOT / "pjrt_plugin" / "build" / "libds_pjrt_plugin.so"
 
-# Relative-error bound reflecting double_binary32_div's real, universal
-# accuracy limit -- see module docstring: dropping the TwoProd/two_mul
-# residual (t3) caps this op at roughly f32-ULP-level accuracy regardless
-# of whether either operand has a non-zero lo channel. Empirically, 500k
-# random trials (both lo=0 and DS-pair-divisor cases) found a worst-case
-# relative error of ~1.16e-7 (~2^-23.05) -- 2^-19 gives ~8x margin above
-# that measured worst case while still being tight enough to catch a real
-# regression (e.g. an operand's lo channel silently being dropped
-# entirely, which would look identical to plain f32 accuracy, ~2^-23).
-# This is a genuinely different (much looser) bound than the other DS ops
-# use, none of which drop a correction term this way.
-DS_DIV_REL_ERR_BOUND = 2.0 ** -19
+# Relative-error bound for divide's corrected internal accuracy -- see
+# module docstring. Same theoretical grounding as the other DS ops:
+# double-word division of this Newton/Sterbenz shape is O(u_f32^2), i.e.
+# O(2^-48) relative error; 2^-40 gives ~2^8 margin above that floor while
+# still being ~1e5x tighter than plain f32's ~2^-23. Confirmed empirically
+# (500k random trials, both lo=0 and DS-pair-divisor cases): worst case
+# ~1.7e-14, comfortably inside this bound.
+DS_DIV_REL_ERR_BOUND = 2.0 ** -40
+
+# Bound for the *observable* (f32-quantized-at-return) result on plain
+# lo=0 inputs -- see Section 3a note. Unrelated to the t3 fix: plain f32
+# division is already correctly-rounded, so an isolated lo=0 division's
+# observable result is capped at roughly f32-ULP level regardless of how
+# accurate divide's internal computation is.
+DS_DIV_OBSERVABLE_REL_ERR_BOUND = 2.0 ** -22
 
 PASS_MARK = "  PASS "
 FAIL_MARK = "  FAIL "
@@ -141,12 +148,12 @@ def run_numpy_tests():
               rel_err < DS_DIV_REL_ERR_BOUND,
               f"truth={truth}, measured={measured}")
 
-    # ── divisor-has-real-lo: exercises the known t3-omission limitation ──────
+    # ── divisor-has-real-lo: regression test for the corrected t3 term ───────
     # This case uses a divisor with a genuine non-zero lo (via two_sum) --
-    # it's subject to the same universal ~2^-24-class limitation as the
-    # plain lo=0 cases above (see module docstring), not a separate worse
-    # one. Found via a 500k-trial random search to sit close to the
-    # measured worst case (~1.16e-7, ~2^-23) documented on the bound above.
+    # the case that most directly exercises the b_lo/t4 path. Prior to the
+    # `-t3` correction this landed near the measured worst case for the
+    # literal library formula (~1.16e-7, ~2^-23); with the correction it
+    # should be back at DS_DIV_REL_ERR_BOUND's double-word class.
     b_hi, b_lo = ds_ref.two_sum(np.float32(-988.1205970793266),
                                  np.float32(-0.07021472772014681))
     a_val = np.float32(8252.133301039248)
@@ -154,7 +161,7 @@ def run_numpy_tests():
     truth = float(a_val) / (float(b_hi) + float(b_lo))
     measured = float(h) + float(l)
     rel_err = abs(measured - truth) / abs(truth)
-    check(f"div: divisor with real lo -- within known-limitation bound (rel_err={rel_err:.3e})",
+    check(f"div: divisor with real lo -- within DS bound (rel_err={rel_err:.3e})",
           rel_err < DS_DIV_REL_ERR_BOUND,
           f"truth={truth}, measured={measured}, b_hi={b_hi}, b_lo={b_lo}")
     # Also confirm the divisor's lo channel isn't dropped *entirely* (a
@@ -287,20 +294,19 @@ def run_gpu_tests():
     # emitToFloat at func.return), so the *observable* result is quantized
     # back to one f32 -- and plain f32 division is already IEEE correctly-
     # rounded, so there is no more-accurate single-f32 answer to find for
-    # an isolated lo=0 division. That alone would only justify a ~2^-24
-    # bound; separately, divide's own t3-omission limitation (see module
-    # docstring) lands in the same ballpark regardless of lo. Both reasons
-    # point to the same DS_DIV_REL_ERR_BOUND used in Section 1 -- there is
-    # no tighter DS-internal bound to fall back on for divide the way
-    # there is for the other DS ops. DS's real, measurable advantage here
-    # is in composed/chained ops (checked in 3c) and the pair-accuracy
-    # variant below (which is checking a cancellation-recovery property,
-    # not divide's own precision limit).
+    # an isolated lo=0 division, regardless of how accurate divide's
+    # internal (hi, lo) computation is. This is unrelated to and unchanged
+    # by the t3 correction (see module docstring) -- it's an output-
+    # quantization limit, the same "no benefit when lo=0" pattern already
+    # documented for standalone matmul in this project. DS's real,
+    # measurable advantage is checked in 3b (internal pair, where the t3
+    # correction IS observable), 3c (composition), and Section 1's lo != 0
+    # cross-check.
     ds_result = np.array(block(div_fn(jnp.array(a_vals), jnp.array(b_vals))))
     truth = a_vals.astype(np.float64) / b_vals.astype(np.float64)
     rel_err = np.abs(ds_result - truth) / np.maximum(np.abs(truth), 1e-300)
-    check(f"unit accuracy: max relative error {rel_err.max():.3e} < bound {DS_DIV_REL_ERR_BOUND:.3e} (divide's own accuracy limit)",
-          bool(np.all(rel_err < DS_DIV_REL_ERR_BOUND)),
+    check(f"unit accuracy: max relative error {rel_err.max():.3e} < bound {DS_DIV_OBSERVABLE_REL_ERR_BOUND:.3e} (correctly-rounded f32 level)",
+          bool(np.all(rel_err < DS_DIV_OBSERVABLE_REL_ERR_BOUND)),
           f"ds={ds_result}, truth={truth}, rel_err={rel_err}")
 
     f32_only = (a_vals / b_vals).astype(np.float64)

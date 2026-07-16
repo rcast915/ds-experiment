@@ -38,7 +38,10 @@
 // (double_binary32_neg/fabs/compare/div/sqrt) -- see that library for the
 // authoritative reference and handoff.md for port notes. The library's
 // __two_mul (FMA-based) is not used as-is for divide/sqrt -- see
-// emitDsDiv's comment for why, and what's substituted instead.
+// emitDsDiv's comment for why, and what's substituted instead. divide's
+// emitDsDiv also includes one deliberate correction beyond a literal
+// port (a dropped TwoProd residual term, confirmed to be a genuine bug
+// in the reference rather than a design choice) -- see its comment.
 //
 //===----------------------------------------------------------------------===//
 
@@ -205,46 +208,47 @@ static std::pair<Value, Value> emitDsMul(OpBuilder& bld, Location loc,
 }
 
 // ds_div((a_hi, a_lo), (b_hi, b_lo)) → (out_hi, out_lo)
-// Ported exactly from double-single-lib's double_binary32_div:
+// Based on double-single-lib's double_binary32_div, WITH ONE DELIBERATE
+// CORRECTION (see below) to a confirmed bug in the reference:
 //   t1 = a_hi / b_hi
 //   (t2, t3) = two_mul(b_hi, t1)
 //   t4 = b_lo * t1
 //   t5 = a_hi - t2        [Sterbenz: exact -- t2 is close enough to a_hi
 //                           that this subtraction introduces no rounding]
 //   t6 = a_lo - t4
-//   t7 = t5 + t6
+//   t7 = (t5 + t6) - t3   [see note: library's literal t7 = t5 + t6 drops t3]
 //   t8 = t7 / b_hi
 //   (out_hi, out_lo) = fast_two_sum(t1, t8)
 //
-// KNOWN LIBRARY LIMITATION, kept as-is (not "fixed") per this project's
-// port-the-reference-exactly policy: t3, the TwoProd/two_mul residual of
-// b_hi*t1, is computed above and then never used again -- t6 subtracts
-// t4 (the b_lo*t1 contribution), not t3. Re-deriving the correction
-// algebraically: for a/b = t1 + delta, the exact identity
-// a_hi - t1*b_hi = t5 - t3 shows the correction sum should be
-// `t5 - t3 + a_lo - t4`, not `t5 + a_lo - t4` as written here. This is
-// confirmed to be a genuine omission and not an intentional design
-// choice: the library's OWN sibling routine for the "divide a DS pair by
-// a plain scalar" case, __double_binary_div_double_by_single (see
-// emitDsDivByScalar below, used by sqrt), computes the analogous term as
-// `al - t3` -- i.e. it correctly keeps the residual that this routine
-// drops. IMPORTANT -- this is not an adversarial-input-only corner case:
-// t3 captures t1's own single-precision rounding error (t1 = a_hi/b_hi is
-// only correctly-rounded, not exact), which the exact identity above
-// shows the correction needs regardless of b_lo. Empirically (500k
-// random trials, host-side check, both b_lo=0 and b_lo!=0), omitting t3
-// costs up to ~1.16e-7 relative error (~2^-23, f32-ULP level) on the
-// combined (hi, lo) result for EVERY division through this routine,
-// including plain lo=0/lo=0 cases with no cancellation at all -- not the
-// ~2^-48-class accuracy a double-word division algorithm of this shape
-// is designed to reach. In other words: this port's emitDsDiv provides
-// roughly one correctly-rounded division's worth of precision, not the
-// deep double-word accuracy the other DS ops (add/sub/mul/sqrt) achieve.
-// See test_ds_divide.py's DS_DIV_REL_ERR_BOUND for the bound derived
-// from this finding, used uniformly (not just for a divisor-lo!=0 case).
+// DEVIATION FROM THE LIBRARY, deliberate: as literally written,
+// double_binary32_div computes t7 = t5 + t6, never using t3 (the
+// TwoProd/two_mul residual of b_hi*t1) again after computing it.
+// Re-deriving the correction algebraically: for a/b = t1 + delta, the
+// exact identity a_hi - t1*b_hi = t5 - t3 shows the correction sum needs
+// `t5 - t3 + a_lo - t4`, not `t5 + a_lo - t4`. Confirmed this is a
+// genuine omission and not an intentional design choice: the library's
+// OWN sibling routine for "divide a DS pair by a plain scalar",
+// __double_binary_div_double_by_single (see emitDsDivByScalar below,
+// used by sqrt), computes the analogous term as `al - t3` -- i.e. it
+// correctly keeps the residual this routine drops. And it is not an
+// adversarial-input-only corner case: t3 captures t1's own
+// single-precision rounding error (t1 = a_hi/b_hi is only
+// correctly-rounded, not exact), so it matters regardless of b_lo --
+// empirically, the literal library formula costs up to ~1.16e-7 relative
+// error (~2^-23, f32-ULP level) on EVERY division through this routine,
+// including plain lo=0/lo=0 cases with no cancellation at all, instead of
+// the ~2^-48-class accuracy this algorithm's structure is designed to
+// reach. Including the `- t3` term above restores that accuracy
+// (confirmed empirically: worst case ~1.7e-14 over 500k random trials,
+// vs. add/sub/mul/sqrt's established double-word precision class) at the
+// cost of one extra stablehlo.subtract op. This correction was an
+// explicit choice, not the port-the-reference-exactly default this
+// project otherwise follows -- flagging it here since it's the one place
+// this port intentionally diverges from what the source literally says
+// beyond the unavoidable FMA substitution below.
 //
-// Deviation from the library, deliberate (unlike the t3 omission above,
-// which is kept as-is): the library's __two_mul uses a real hardware FMA
+// Deviation from the library, deliberate (separately, and unavoidable):
+// the library's __two_mul uses a real hardware FMA
 // (__builtin_fmaf(a, b, -h)) for its TwoProduct, which cannot be
 // expressed as separate StableHLO ops -- by the time a stablehlo.multiply's
 // result is available, it is already rounded, so a following
@@ -268,7 +272,8 @@ static std::pair<Value, Value> emitDsDiv(OpBuilder& bld, Location loc,
     Value t4 = bld.create<stablehlo::MulOp>(loc, b_lo, t1);
     Value t5 = bld.create<stablehlo::SubtractOp>(loc, a_hi, t2);
     Value t6 = bld.create<stablehlo::SubtractOp>(loc, a_lo, t4);
-    Value t7 = bld.create<stablehlo::AddOp>(loc, t5, t6);
+    Value t6sum = bld.create<stablehlo::AddOp>(loc, t5, t6);
+    Value t7 = bld.create<stablehlo::SubtractOp>(loc, t6sum, t3);  // correction: see comment above
     Value t8 = bld.create<stablehlo::DivOp>(loc, t7, b_hi);
     return emitFastTwoSum(bld, loc, t1, t8);
 }
@@ -286,19 +291,20 @@ static std::pair<Value, Value> emitDsDiv(OpBuilder& bld, Location loc,
 //   t7 = t6 / b
 //   (out_hi, out_lo) = fast_two_sum(t1, t7)
 //
-// IMPORTANT: this is NOT the same sequence as calling emitDsDiv(a_hi,
-// a_lo, b, 0) with a zero lo operand, despite both dividing by something
-// with an effectively-zero low channel -- double_binary32_div (what
-// emitDsDiv ports, see below) drops the TwoProd/two_mul residual (t3)
-// from its correction sum entirely, while THIS routine correctly keeps
-// it (t5 = a_lo - t3). Confirmed by reading both routines side by side
-// in the reference source: this is a genuine difference between the two
-// library functions, not two equivalent formulations of the same thing.
-// A DS/DS emitDsDiv-based substitution here would silently inherit
-// emitDsDiv's t3-omission (see its comment for the full finding and why
-// divide keeps that omission, as a literal port of an authoritative but
-// evidently imperfect reference) -- sqrt does not need to inherit it,
-// since double_binary32_sqrt calls the *other*, more accurate helper.
+// NOTE: kept as its own function rather than calling emitDsDiv(a_hi,
+// a_lo, b, 0) with a zero lo operand, for two reasons. First, fidelity:
+// __double_binary_div_double_by_single is what double_binary32_sqrt
+// actually calls in the reference source, not double_binary32_div with a
+// zero lo -- porting the function that's actually called is more
+// faithful even where the two happen to be numerically close. Second,
+// even after emitDsDiv's own `-t3` correction (see its comment) makes
+// the two algebraically equivalent when b_lo=0 -- both reduce to
+// `t5 + a_lo - t3` as real numbers -- they are NOT bit-identical:
+// emitDsDiv computes it as `(t5 + a_lo) - t3` (add then subtract) while
+// this routine computes `t5 + (a_lo - t3)` (subtract then add), and
+// floating-point addition/subtraction is not associative, so the two
+// orderings can round differently in the last bit. Keeping this as a
+// direct, separate port avoids relying on that coincidental equivalence.
 static std::pair<Value, Value> emitDsDivByScalar(OpBuilder& bld, Location loc,
                                                    Value a_hi, Value a_lo,
                                                    Value b) {
@@ -574,9 +580,11 @@ struct DsTransformPass
             }
 
             // ── stablehlo.divide ──────────────────────────────────────────
-            // Ported from double-single-lib's double_binary32_div -- see
-            // emitDsDiv for the exact sequence and the FMA/two_mul
-            // substitution note. No special-casing for b_hi == 0 or
+            // Based on double-single-lib's double_binary32_div -- see
+            // emitDsDiv for the exact sequence, the FMA/two_mul
+            // substitution note, and the deliberate `-t3` correction (one
+            // intentional deviation from the literal library, fixing a
+            // confirmed bug there). No special-casing for b_hi == 0 or
             // negative/NaN inputs -- the library doesn't special-case them
             // either. Note this is NOT the same as plain a/b's IEEE
             // propagation: b_hi == 0 makes t1 = a_hi/b_hi an infinity,
