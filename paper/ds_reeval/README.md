@@ -21,6 +21,8 @@ until you have run this suite and reviewed `REPORT.md`.
 | `exp1_gemm_highest.py` | Worker: f64-vs-DS GEMM sweep at default and HIGHEST precision. |
 | `exp2_tf32_dispatch.py` | Worker: dumps XLA HLO (+ optional `nsys` profile) to identify what kernel the DS sub-GEMMs actually dispatch to. |
 | `exp3_pair_accuracy.py` | Worker: compares recombined-in-function vs. host-recombined (raw hi/lo) reduction error. |
+| `exp4_divide_worst_case.py` | Worker: worst-case relative accuracy of DS divide post the `-t3` correction (random sweep + adversarial + power-of-two + beyond-safe-range probe). |
+| `exp5_f64_reduction_bisection.py` | Worker: bisects the f64-input reduction ingestion path (ground truth/methodology, split fidelity, single op, error-vs-length, recombination) to root-cause the paper's f64 reduction residual. |
 | `run_all.py` | Driver — launches one subprocess per (experiment × configuration) with the right environment. |
 | `report.py` | Assembles all present `results/<gpu>/*.json` into `REPORT.md`. Degrades gracefully over partial results. |
 | `test_return_pairs_structural.py` | CPU-only (no GPU) structural test for the new `DS_RETURN_PAIRS` pass flag. Run this first. |
@@ -35,10 +37,14 @@ Also part of this change, outside `ds_reeval/`:
 
 ## Step 0 — read this if you only read one section
 
-Experiments 1–3 need a GPU node inside the project's Docker/Singularity
+Experiments 1–5 need a GPU node inside the project's Docker/Singularity
 container, on **both** target clusters (Punakha H100 and Bridges-2 L40S —
 the paper's claims are cross-GPU, so both need a run). Budget for two
 separate cluster sessions. Nothing here needs both GPUs simultaneously.
+Experiments 4 and 5 additionally require the divide/sqrt commits already
+in `stablehlo_pass/DsTransformPass.cpp` (the `-t3` correction and
+`emitDsDivByScalar`) — Step 1's rebuild covers this, since it's the same
+binary Experiments 1–3 already require rebuilding.
 
 ## Step 1 — rebuild `stablehlo_pass` (required, one-time per cluster/container)
 
@@ -210,7 +216,14 @@ ds_reeval/results/
 │   ├── exp2_tf32_dispatch_highest.json
 │   ├── xla_dumps/{default,highest}/             # raw XLA HLO text + nsys reports (large; gitignored)
 │   ├── exp3_pair_accuracy_standard.json
-│   └── exp3_pair_accuracy_pairs.json
+│   ├── exp3_pair_accuracy_pairs.json
+│   ├── exp4_divide_worst_case_internal.json
+│   ├── exp4_divide_worst_case_observable.json
+│   ├── exp5_f64_reduction_bisection_ground_truth.json
+│   ├── exp5_f64_reduction_bisection_split_fidelity.json
+│   ├── exp5_f64_reduction_bisection_single_op.json
+│   ├── exp5_f64_reduction_bisection_length_scan.json
+│   └── exp5_f64_reduction_bisection_recombination.json
 └── <other-gpu-tag>/...                          # after the second cluster's run
 ds_reeval/REPORT.md                                # written by report.py, reads both gpu dirs if present
 ```
@@ -231,7 +244,12 @@ clobber the first run's provenance.
   measured (per the paper, 12.19 ms at 2048² alone — the point of the
   whole exercise). Experiment 2 adds time only if `nsys` is available
   (profiling has overhead; HLO-dump-only is fast). Experiment 3 is small
-  (a single 10,000-element reduction) and fast regardless.
+  (a single 10,000-element reduction) and fast regardless. Experiment 4's
+  random sweep is the biggest new cost (default 3 seeds × 100,000 samples
+  per mode, `--divide-samples-per-seed` to adjust) but each seed is one
+  batched GPU divide call, so still well under a minute per mode in
+  practice. Experiment 5's five stages are all small (single elements or
+  length ≤10,000), dominated by process startup, not compute.
 
 ## Reading `REPORT.md`
 
@@ -246,6 +264,16 @@ was actually available — read the "evidence quality" column before trusting
 a YES/NO at face value; `nsys_kernel_names` is stronger evidence than
 `hlo_dump_text_match`, which in turn is stronger than
 `hlo_dump_present_but_inconclusive`.
+
+Experiment 4 has no PASS/FAIL verdict against a prior published number —
+`paper/main.tex` doesn't have a divide worst-case figure yet, only a
+pre-fix baseline (1.16e-7) to compare the post-fix number against;
+IMPROVED/REGRESSED in the summary table reflects that comparison, not a
+reproduction check. Experiment 5 similarly has no PASS/FAIL — its
+"verdict" is either a stated root cause (most likely: a methodology
+mismatch between the existing f64 test and the f32-input claim it's
+compared against, see Stage 1) or the narrowest bracket the stages that
+ran actually establish.
 
 `report.py` is safe to re-run any time (e.g. after only one cluster's run
 has finished) — it only reads whatever JSON currently exists under
@@ -290,15 +318,41 @@ already has 2 outputs of the same type/shape whether the flag is on or
 off, so `DS_RETURN_PAIRS` only changes *which value* lands in each slot,
 never the function's signature.
 
-**Scope:** only applies to operands whose declared return type is already
-f32 (which `hi`/`lo` always are) — f64-typed returns always fall back to
-ordinary recombination, since substituting an f32 value for a declared f64
-result would be ill-typed. Extending it to f64 would additionally require
-updating the `FuncOp`'s result-type signature, which was left out as
-unnecessary scope for what Experiment 3 needs (it is explicitly an
-f32-input claim). A value returned only once, or 3+ times, is unaffected
-(falls back to normal recombination) — the flag only ever special-cases
-the exact doubled-return pattern.
+**Scope:** applies to operands whose declared return type is either f32
+(the common case — `hi`/`lo` are already that type, so they're substituted
+directly) or f64. For an f64-typed doubled return, substituting a raw f32
+`hi`/`lo` directly would be ill-typed, so each is widened first
+(`convert(hi, f64)`, `convert(lo, f64)` — both exact, since widening f32 to
+f64 never loses precision) and *those* are substituted instead of the
+(lossy-at-output) `hi+lo` sum `emitToFloat` would otherwise produce. Either
+way the `FuncOp`'s result-type signature never changes — the substituted
+value always matches the type the operand already had. The f64 case was
+added specifically because `exp5_f64_reduction_bisection.py` needed to
+observe a raw f64-sourced DS pair, which the original f32-only version of
+this flag could not do (see its stage docstrings and
+`DsTransformPass.cpp`'s func.return comment for the exact mechanism). A
+value returned only once, or 3+ times, is unaffected (falls back to normal
+recombination) — the flag only ever special-cases the exact doubled-return
+pattern, for either type.
+
+**Bug found and fixed (f64 case) — see `exp5_f64_reduction_bisection.py`'s
+module docstring and `DsTransformPass.cpp`'s func.return comment for the
+full account.** Initial testing found several `exp5` stages showing
+symptoms not explained by the MLIR the pass emits (which was correct).
+Root cause: substitution was decided per-operand from "1st or 2nd
+occurrence seen so far" with no check on the *total* occurrence count, so
+a value returned exactly once also hit "1st occurrence" and silently lost
+`lo`. Predates this session's f64 extension, but was invisible for f32
+(dropped `lo` and full `hi+lo` recombination are typically bit-identical
+after f32 output quantization) and untested for a single return under the
+flag (Experiment 3 always used the genuine doubled-return pattern). Fixed
+by requiring a value's total occurrence count to be exactly 2 before
+substituting at all; confirmed via `null_test_return_pairs_noop.py` (f64
+flag on/off now bit-identical for a single return) and a new structural
+regression case in `test_return_pairs_structural.py`. Experiment 3's own
+figure and `exp4`'s divide worst-case measurement were never affected —
+both use the doubled-return pattern on f32 arrays throughout, and both
+were independently reconfirmed unaffected before the fix was even found.
 
 **Verifying the "default behavior is untouched" guarantee:** the
 `DS_RETURN_PAIRS == false` code path in `DsTransformPass.cpp` is,

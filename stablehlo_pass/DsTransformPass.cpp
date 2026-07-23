@@ -872,36 +872,91 @@ struct DsTransformPass
             // ds_reeval/exp3_pair_accuracy.py and
             // ds_reeval/test_return_pairs_structural.py).
             //
-            // This only ever substitutes a value of the *same type* as the
-            // operand it replaces (guarded by `orig.getType() ==
-            // hi.getType()`, i.e. the operand's declared return type must
-            // already be f32, which hi/lo always are) -- so the FuncOp's
-            // result-type signature never needs to change, and there is no
-            // risk of emitting ill-typed IR or changing the function's
-            // arity as JAX originally traced it. f64-typed returns (hi/lo
-            // are f32 but the declared return type is f64) always fall
-            // back to normal recombination below, since substituting an
-            // f32 value for an f64 result would be ill-typed; extending
-            // DS_RETURN_PAIRS to that case would additionally require
-            // updating func.getFunctionType(), which is out of scope here.
+            // Two return-type cases, both handled without ever changing the
+            // FuncOp's result-type signature or the function's arity as JAX
+            // originally traced it (no risk of ill-typed IR either way):
+            //   - f32-typed return (orig.getType() == hi.getType(), the
+            //     common case, e.g. Experiment 3's f32-input reduction):
+            //     substitute hi/lo directly -- they're already the right type.
+            //   - f64-typed return (hi/lo are f32 but the declared return
+            //     type is f64, e.g. exp5_f64_reduction_bisection.py's
+            //     f64-input probes): substitute convert(hi, f64) and
+            //     convert(lo, f64) instead -- two separate f64-typed outputs,
+            //     each an exact widening of one raw component, rather than
+            //     their (lossy-at-output) sum. Added alongside the f64
+            //     ingestion-path bisection that needed to observe a raw f64-
+            //     sourced DS pair, which the f32-only version of this flag
+            //     could not do (it always fell back to full recombination
+            //     for f64 returns). This is a test-infrastructure extension
+            //     of an existing opt-in diagnostic, not a change to how f64
+            //     values are split, combined, or arithmetic'd anywhere else
+            //     in this pass -- the DS_RETURN_PAIRS==false path above is
+            //     untouched, byte-for-byte, exactly as before.
+            //
             // A value returned only once, or a third+ occurrence of the
             // same value, is unaffected either way (falls through to
             // ordinary recombination) -- this deliberately only special-
-            // cases the exact doubled-return pattern above.
+            // cases the exact doubled-return pattern, for either type.
+            //
+            // FIXED BUG (present since DS_RETURN_PAIRS was first added,
+            // predating the f64 extension above): substitution used to be
+            // decided per-operand, in left-to-right scan order, purely
+            // from "is this the 1st or 2nd time I've seen this value SO
+            // FAR" -- with no check on how many times the value appears
+            // in TOTAL. A value returned exactly ONCE therefore also hit
+            // idx==0 on its only occurrence and got silently substituted
+            // with hi alone, permanently dropping lo, instead of falling
+            // through to ordinary recombination as documented. This was
+            // invisible for f32 returns: hi alone and hi+lo rounded back
+            // to f32 are typically bit-identical anyway (lo is f32-ULP-
+            // scale relative to hi, so plain f32 addition rounds it away
+            // regardless -- the same output-quantization effect
+            // documented throughout this project, e.g. divide's Section
+            // 3a note in test_ds_divide.py). It is NOT invisible for f64:
+            // f64 has enough precision to represent lo's contribution
+            // exactly, so a single f64 return silently losing lo is a
+            // real, measurable correctness bug -- confirmed via a
+            // dedicated null test (null_test_return_pairs_noop.py)
+            // showing a single, non-doubled f64 return changed value
+            // depending solely on whether DS_RETURN_PAIRS=1 was set,
+            // which the documented design says should be impossible.
+            // Fixed by counting each value's TOTAL occurrences across the
+            // whole return list first, and only ever substituting when
+            // that total is exactly 2.
             if (auto retOp = dyn_cast<func::ReturnOp>(op)) {
                 OpBuilder rb(retOp);
+
+                llvm::DenseMap<Value, int> totalCount;
+                for (auto& operand : retOp->getOpOperands()) {
+                    Value orig = operand.get();
+                    if (dsMap.count(orig)) totalCount[orig]++;
+                }
+
                 llvm::DenseMap<Value, int> seen;
                 for (auto& operand : retOp->getOpOperands()) {
                     Value orig = operand.get();
                     if (!dsMap.count(orig)) continue;
                     auto [hi, lo] = dsMap[orig];
 
+                    bool isF32Return = (orig.getType() == hi.getType());
+                    bool isF64Return = !isF32Return && isFloatTensor(orig) &&
+                        cast<RankedTensorType>(orig.getType()).getElementType().isF64();
+
                     bool substitutedPair = false;
-                    if (returnPairs && orig.getType() == hi.getType()) {
+                    if (returnPairs && (isF32Return || isF64Return) && totalCount[orig] == 2) {
                         int idx = seen[orig];
                         seen[orig] = idx + 1;
-                        if (idx == 0) { operand.set(hi); substitutedPair = true; }
-                        else if (idx == 1) { operand.set(lo); substitutedPair = true; }
+                        Value part;
+                        if (idx == 0) { part = hi; substitutedPair = true; }
+                        else if (idx == 1) { part = lo; substitutedPair = true; }
+                        if (substitutedPair) {
+                            if (isF64Return) {
+                                Value widened = rb.create<stablehlo::ConvertOp>(loc, orig.getType(), part);
+                                operand.set(widened);
+                            } else {
+                                operand.set(part);
+                            }
+                        }
                     }
                     if (!substitutedPair) {
                         Value combined = emitToFloat(rb, loc, hi, lo, orig.getType());

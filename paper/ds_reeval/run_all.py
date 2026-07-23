@@ -43,6 +43,10 @@ EXP2_MODES = ["default", "highest"]
 
 EXP3_MODES = ["standard", "pairs"]
 
+EXP4_MODES = ["internal", "observable"]
+
+EXP5_STAGES = ["ground_truth", "split_fidelity", "single_op", "length_scan", "recombination"]
+
 
 def build_env(plugin_path, overrides):
     env = {"PJRT_NAMES_AND_LIBRARY_PATHS": "cuda:{}".format(plugin_path),
@@ -104,11 +108,48 @@ def plan_exp3(args, results_dir):
     return plans
 
 
+def plan_exp4(args, results_dir):
+    plans = []
+    samples = 5000 if args.smoke else args.divide_samples_per_seed
+    for mode in EXP4_MODES:
+        out = results_dir / "exp4_divide_worst_case_{}.json".format(mode)
+        overrides = {"DS_RETURN_PAIRS": "1"} if mode == "internal" else {}
+        env = build_env(args.plugin_path, overrides)
+        argv = [
+            sys.executable, str(THIS_DIR / "exp4_divide_worst_case.py"),
+            "--mode", mode, "--samples-per-seed", str(samples),
+            "--out", str(out),
+        ]
+        plans.append(("exp4 mode={}".format(mode), argv, env, out))
+    return plans
+
+
+def plan_exp5(args, results_dir):
+    plans = []
+    n = 1000 if args.smoke else 10000
+    for stage in EXP5_STAGES:
+        out = results_dir / "exp5_f64_reduction_bisection_{}.json".format(stage)
+        # ground_truth doesn't need DS_RETURN_PAIRS; every other stage does
+        # (see exp5_f64_reduction_bisection.py's module docstring).
+        overrides = {} if stage == "ground_truth" else {"DS_RETURN_PAIRS": "1"}
+        env = build_env(args.plugin_path, overrides)
+        argv = [
+            sys.executable, str(THIS_DIR / "exp5_f64_reduction_bisection.py"),
+            "--stage", stage, "--n", str(n), "--val", "0.1",
+            "--out", str(out),
+        ]
+        plans.append(("exp5 stage={}".format(stage), argv, env, out))
+    return plans
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--experiments", default="1,2,3",
-                    help="Comma-separated subset of {1,2,3} to run (default: all)")
+    p.add_argument("--experiments", default="1,2,3,4,5",
+                    help="Comma-separated subset of {1,2,3,4,5} to run (default: all)")
+    p.add_argument("--divide-samples-per-seed", type=int, default=100_000,
+                    help="Experiment 4: random-sweep samples per seed (full run only; "
+                         "--smoke always uses a small fixed count)")
     p.add_argument("--smoke", action="store_true",
                     help="Reduced sizes/reps for a fast correctness pass. Writes to "
                          "smoke_out/ instead of results/, so it can never be mistaken "
@@ -142,7 +183,7 @@ def parse_args():
 def main():
     args = parse_args()
     exps = set(x.strip() for x in args.experiments.split(","))
-    unknown = exps - {"1", "2", "3"}
+    unknown = exps - {"1", "2", "3", "4", "5"}
     if unknown:
         print("Unknown experiment id(s): {}".format(sorted(unknown)), file=sys.stderr)
         return 2
@@ -163,6 +204,10 @@ def main():
         plans += plan_exp2(args, results_dir)
     if "3" in exps:
         plans += plan_exp3(args, results_dir)
+    if "4" in exps:
+        plans += plan_exp4(args, results_dir)
+    if "5" in exps:
+        plans += plan_exp5(args, results_dir)
 
     if args.dry_run:
         print("# ds_reeval plan -- {} subprocess run(s), GPU tag: {}".format(len(plans), gpu_tag))

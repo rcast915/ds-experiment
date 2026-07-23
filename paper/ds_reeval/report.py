@@ -33,6 +33,13 @@ PAPER_HEADLINE_SPEEDUP_L40S_2048 = 12.87   # paper/main.tex ~line 433, 449
 PAPER_EXP3_F32_ERROR = 4.65e-6             # paper/main.tex ~line 597
 PAPER_EXP3_PLAIN_F32_ERROR = {"H100": 7.16e-5, "L40S": 7.93e-5}  # ~line 596
 PAPER_EXP3_N = 10000                       # paper/main.tex ~line 587 -- only comparable at this n
+PAPER_F64_REDUCTION_DS_ERROR = 1.49e-5     # paper/main.tex ~line 605, absolute error
+PAPER_F64_REDUCTION_F32_ERROR = 1.22e-4    # paper/main.tex ~line 605-606, absolute error
+DIVIDE_PRE_FIX_WORST_CASE = 1.16e-7        # measured before the -t3 correction commit
+                                            # (500k random trials, host-side check) -- not
+                                            # itself a paper figure, just the number Task 1
+                                            # in the request that produced this file names
+                                            # as the pre-fix baseline to improve on.
 
 PAPER_CLAIMS = {
     "1": {
@@ -59,6 +66,28 @@ PAPER_CLAIMS = {
         "note": "Distinct from the *separate* f64-input version of this reduction "
                 "(~line 602-606, an 8× figure with different numbers) -- this experiment "
                 "re-measures the f32-input/15× claim specifically.",
+    },
+    "4": {
+        "title": "DS divide worst-case relative accuracy, post `-t3` correction",
+        "paper_value": "not yet in paper/main.tex as of this writing -- the draft's "
+                        "extended-operations table for divide/sqrt (and the Limitations "
+                        "section's claim that division is unsupported) predate the "
+                        "divide/sqrt port done in this repo's history; this experiment "
+                        "supplies the number for whenever that table is added.",
+        "paper_location": "none yet -- see paper_value",
+        "note": "Pre-fix worst case (500k random trials, host-side check, before the "
+                "-t3 correction commit): {:.3e}. Expected post-fix scale: ~2^-48-class "
+                "(double-word), same as add/sub/mul/sqrt.".format(DIVIDE_PRE_FIX_WORST_CASE),
+    },
+    "5": {
+        "title": "f64-input reduction (n=10000, val=0.1) residual root cause",
+        "paper_value": "paper/main.tex currently states an explanation (input-"
+                        "representation error dominates, ~line 608-617) for an 8x error "
+                        "reduction figure (DS {:.2e} vs f32 {:.2e}, ~line 602-606) as "
+                        "settled fact, not as an open question under investigation -- this "
+                        "experiment checks whether that explanation is actually correct.".format(
+                            PAPER_F64_REDUCTION_DS_ERROR, PAPER_F64_REDUCTION_F32_ERROR),
+        "paper_location": "paper/main.tex §Reduction Precision (~line 602-617)",
     },
 }
 
@@ -329,6 +358,185 @@ def render_exp3(results_dir):
     return "\n".join(lines), verdict
 
 
+def render_exp4(results_dir):
+    modes = {mode: load_json(results_dir / "exp4_divide_worst_case_{}.json".format(mode))
+             for mode in ["internal", "observable"]}
+
+    lines = ["### Experiment 4 — DS divide worst-case relative accuracy (post `-t3` fix)", ""]
+    if all(v is None for v in modes.values()):
+        lines.append("_Not yet run on this GPU._")
+        return "\n".join(lines), None
+
+    lines.append(
+        "Measures divide's worst-case relative accuracy now that emitDsDiv's "
+        "dropped TwoProd residual (`t3`) has been restored (see "
+        "stablehlo_pass/DsTransformPass.cpp's emitDsDiv comment). Pre-fix "
+        "worst case (500k random trials, host-side check): **{:.3e}** "
+        "(f32-ULP class). `internal` is divide's own arithmetic accuracy "
+        "(via DS_RETURN_PAIRS=1, host-recombined in f64) -- this is the "
+        "number for the paper's table. `observable` is the ordinary "
+        "f32-typed return, included for comparison but expected to sit at "
+        "correctly-rounded-f32 level regardless of internal accuracy for "
+        "lo=0 inputs (an isolated correctly-rounded division can't be "
+        "improved on by definition).\n".format(DIVIDE_PRE_FIX_WORST_CASE)
+    )
+
+    rows = ["| Mode | Random-sweep max | Random-sweep median | Samples | "
+            "Adversarial max | Power-of-two all exact? |",
+            "|---|---|---|---|---|---|"]
+    worst_internal = None
+    for mode, doc in modes.items():
+        if not doc:
+            rows.append("| {} | NOT RUN | — | — | — | — |".format(mode))
+            continue
+        rs = doc.get("random_sweep", {})
+        adv = doc.get("adversarial_cases", [])
+        adv_max = max((c["rel_err"] for c in adv), default=None)
+        pow2 = doc.get("power_of_two_divisors", {})
+        rows.append("| {} | {} | {} | {} | {} | {} |".format(
+            mode,
+            "{:.3e}".format(rs["combined_max_rel_err"]) if rs.get("combined_max_rel_err") is not None else "—",
+            "{:.3e}".format(rs["combined_median_rel_err"]) if rs.get("combined_median_rel_err") is not None else "—",
+            rs.get("total_samples", "—"),
+            "{:.3e}".format(adv_max) if adv_max is not None else "—",
+            pow2.get("all_exact", "—"),
+        ))
+        if mode == "internal" and rs.get("combined_max_rel_err") is not None:
+            worst_internal = max(
+                rs["combined_max_rel_err"],
+                adv_max if adv_max is not None else 0.0,
+            )
+    lines.append("\n".join(rows) + "\n")
+
+    if worst_internal is not None:
+        improvement = (DIVIDE_PRE_FIX_WORST_CASE / worst_internal) if worst_internal > 0 else float("inf")
+        double_word_class = worst_internal < 2.0 ** -40
+        lines.append(
+            "**Internal worst-case: {:.3e}** ({} pre-fix {:.3e}, ~{:.1f}x "
+            "{}). This {} the ~2^-48-class double-word bound the paper's "
+            "extended-operations table wants.\n".format(
+                worst_internal,
+                "improves on" if worst_internal < DIVIDE_PRE_FIX_WORST_CASE else "DOES NOT improve on",
+                DIVIDE_PRE_FIX_WORST_CASE, improvement,
+                "better" if worst_internal < DIVIDE_PRE_FIX_WORST_CASE else "worse",
+                "is consistent with" if double_word_class else "is NOT consistent with (still f32-ULP class)",
+            )
+        )
+
+    for mode, doc in modes.items():
+        if not doc:
+            continue
+        probe = doc.get("safe_range_probe", {})
+        if probe.get("cases"):
+            lines.append("<details><summary>{}: beyond-safe-range probe "
+                          "(characterization only, not asserted)</summary>\n".format(mode))
+            lines.append("| Case | a/limit | Measured finite? | rel_err (if finite) |")
+            lines.append("|---|---|---|---|")
+            for c in probe["cases"]:
+                lines.append("| {} | {:.2f}x | {} | {} |".format(
+                    c["label"], c["a_over_limit"], c["measured_is_finite"],
+                    "{:.3e}".format(c["rel_err_if_finite"]) if c["rel_err_if_finite"] is not None else "—"))
+            lines.append("\n</details>\n")
+
+    return "\n".join(lines), worst_internal
+
+
+def render_exp5(results_dir):
+    stages = {s: load_json(results_dir / "exp5_f64_reduction_bisection_{}.json".format(s))
+              for s in ["ground_truth", "split_fidelity", "single_op", "length_scan", "recombination"]}
+
+    lines = ["### Experiment 5 — f64-input reduction residual: root cause bisection", ""]
+    if all(v is None for v in stages.values()):
+        lines.append("_Not yet run on this GPU._")
+        return "\n".join(lines), None
+
+    gt = stages["ground_truth"]
+    if gt and gt.get("methodology_finding"):
+        lines.append("**Stage 1 (ground truth / methodology) finding:**\n")
+        lines.append("> {}\n".format(gt["methodology_finding"]))
+        existing = gt.get("existing_test_reproduction", {})
+        corrected = gt.get("corrected_apples_to_apples_test", {})
+        lines.append(
+            "| | Operation | DS result | Truth | DS error (abs) | DS error (rel) |\n"
+            "|---|---|---|---|---|---|\n"
+            "| Existing test (as currently written) | {} | {} | {} | {} | {} |\n"
+            "| Corrected (apples-to-apples with f32-input claim) | {} | {} | {} | {} | {} |\n".format(
+                existing.get("operation", "—"), fmt_ms(existing.get("ds_result")),
+                fmt_ms(existing.get("truth_f64")),
+                "{:.3e}".format(existing["ds_error_abs"]) if "ds_error_abs" in existing else "—",
+                "{:.3e}".format(existing["ds_error_rel"]) if "ds_error_rel" in existing else "—",
+                corrected.get("operation", "—"), fmt_ms(corrected.get("ds_result")),
+                fmt_ms(corrected.get("truth_f64_fsum")),
+                "{:.3e}".format(corrected["ds_error_abs"]) if "ds_error_abs" in corrected else "—",
+                "{:.3e}".format(corrected["ds_error_rel"]) if "ds_error_rel" in corrected else "—",
+            )
+        )
+
+    rows = ["| Stage | Key result | Verdict |", "|---|---|---|"]
+    for name in ["ground_truth", "split_fidelity", "single_op", "length_scan", "recombination"]:
+        doc = stages[name]
+        if not doc:
+            rows.append("| {} | NOT RUN | — |".format(name))
+            continue
+        if name == "ground_truth":
+            key = "see table above"
+            verdict = "METHODOLOGY MISMATCH" if doc.get("same_operation_as_f32_input_claim") is False else "—"
+        elif name == "split_fidelity":
+            split2 = doc.get("compiled_split_times_two_via_DS_RETURN_PAIRS", {})
+            key = "max rel_err {:.3e}".format(split2.get("max_rel_err", float("nan")))
+            verdict = doc.get("verdict", "—")
+        elif name == "single_op":
+            key = "max rel_err {:.3e}".format(doc.get("max_rel_err", float("nan")))
+            verdict = doc.get("verdict", "—")
+        elif name == "length_scan":
+            key = doc.get("growth_classification", "—")
+            verdict = "n/a (see rows in JSON)"
+        else:  # recombination
+            key = "error_rel {:.3e}".format(doc.get("error_rel", float("nan")))
+            verdict = "cross-reference vs. ground_truth's corrected test (see note)"
+        rows.append("| {} | {} | {} |".format(name, key, verdict))
+    lines.append("\n".join(rows) + "\n")
+
+    # Synthesize a bracket from whichever stages actually ran.
+    clean_stages = []
+    dirty_stages = []
+    for name in ["split_fidelity", "single_op"]:
+        doc = stages[name]
+        if not doc:
+            continue
+        v = str(doc.get("verdict", ""))
+        (clean_stages if v.startswith("CLEAN") else dirty_stages).append(name)
+
+    if gt and gt.get("same_operation_as_f32_input_claim") is False:
+        bracket = (
+            "**Root cause: methodology mismatch, not a pass defect.** The "
+            "existing f64-input reduction test measures a different "
+            "operation (plain sum) than the f32-input claim it was being "
+            "compared against (sum of squares) -- see Stage 1 above. "
+            + (
+                "Stages run beyond ground_truth ({}) found no defect in "
+                "the f64 ingestion path itself.".format(", ".join(clean_stages))
+                if clean_stages and not dirty_stages else
+                "Further stages ({}) below are still worth reading for "
+                "the f64 path's own accuracy, independent of this finding.".format(
+                    ", ".join(s for s in stages if stages[s]) or "none run yet")
+            )
+        )
+    elif dirty_stages:
+        bracket = "**Bracket: error absent before {}, present at/after {}.**".format(
+            ", ".join(clean_stages) or "no clean stage observed",
+            ", ".join(dirty_stages))
+    elif clean_stages:
+        bracket = ("**All bisected stages ({}) are clean (double-word-class "
+                    "accuracy).** No pass defect isolated in the f64 ingestion "
+                    "path by this bisection.").format(", ".join(clean_stages))
+    else:
+        bracket = "**Insufficient stages run to state a bracket.**"
+    lines.append(bracket + "\n")
+
+    return "\n".join(lines), bracket
+
+
 def render_manifest_summary(results_dir):
     manifest = load_json(results_dir / "manifest.json")
     if not manifest:
@@ -386,12 +594,16 @@ def main():
         out.append(render_exp2b(gdir))
         exp3_md, exp3_verdict = render_exp3(gdir)
         out.append(exp3_md)
-        summary_rows.append((gpu_tag, headline_highest, exp3_verdict))
+        exp4_md, divide_worst_internal = render_exp4(gdir)
+        out.append(exp4_md)
+        exp5_md, exp5_bracket = render_exp5(gdir)
+        out.append(exp5_md)
+        summary_rows.append((gpu_tag, headline_highest, exp3_verdict, divide_worst_internal, exp5_bracket))
 
     out.append("## Summary\n")
     out.append("| # | Claim | Paper says | Measured | Verdict |")
     out.append("|---|---|---|---|---|")
-    for gpu_tag, headline_highest, exp3_verdict in summary_rows:
+    for gpu_tag, headline_highest, exp3_verdict, divide_worst_internal, exp5_bracket in summary_rows:
         if headline_highest:
             h_str = "{:.2f}× (HIGHEST precision)".format(headline_highest)
             h_verdict = ("CHANGED" if abs(headline_highest - PAPER_HEADLINE_SPEEDUP_L40S_2048)
@@ -410,6 +622,14 @@ def main():
         out.append("| 3 ({}) | {} | ~15× ({:.2e} vs ~{:.2e}) | see Experiment 3 section above | {} |".format(
             gpu_tag, PAPER_CLAIMS["3"]["title"], PAPER_EXP3_F32_ERROR, plain_f32_ref,
             exp3_verdict or "not yet run"))
+        out.append("| 4 ({}) | {} | not yet in paper draft (pre-fix baseline {:.2e}) | {} | {} |".format(
+            gpu_tag, PAPER_CLAIMS["4"]["title"], DIVIDE_PRE_FIX_WORST_CASE,
+            "{:.3e}".format(divide_worst_internal) if divide_worst_internal is not None else "not yet run",
+            ("IMPROVED" if divide_worst_internal is not None and divide_worst_internal < DIVIDE_PRE_FIX_WORST_CASE
+             else ("REGRESSED" if divide_worst_internal is not None else "—"))))
+        out.append("| 5 ({}) | {} | states an explanation as settled fact | see Experiment 5 section above | {} |".format(
+            gpu_tag, PAPER_CLAIMS["5"]["title"],
+            "see bracket above" if exp5_bracket else "not yet run"))
 
     Path(args.out).write_text("\n".join(out) + "\n")
     print("Wrote {} covering GPU(s): {}".format(args.out, ", ".join(gpus)))

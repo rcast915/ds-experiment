@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Structural (CPU-only, no GPU/PJRT execution) test for the DS_RETURN_PAIRS=1
-flag added to stablehlo_pass/DsTransformPass.cpp for Experiment 3.
+flag added to stablehlo_pass/DsTransformPass.cpp for Experiment 3, plus its
+later extension to f64-typed returns (added for
+exp5_f64_reduction_bisection.py, which needs to observe a raw f64-sourced
+DS pair -- the original f32-only version of this flag could not do that).
 
 Drives `mlir-ds-opt` directly on a hand-written, minimal StableHLO function
 rather than going through JAX tracing, so the exact input op sequence is
@@ -67,6 +70,34 @@ MLIR_INPUT = """\
 func.func @ret_twice(%arg0: tensor<f32>) -> (tensor<f32>, tensor<f32>) {
   %unused = stablehlo.constant dense<0> : tensor<i32>
   func.return %arg0, %arg0 : tensor<f32>, tensor<f32>
+}
+"""
+
+# f64 variant of the same test, added alongside DS_RETURN_PAIRS's extension
+# to f64-typed returns (see DsTransformPass.cpp's func.return comment).
+# emitFromFloat's f64 path additionally does the argument split itself (2
+# converts + 1 subtract, at arg-processing time, independent of
+# DS_RETURN_PAIRS) before func.return's own handling runs -- see the op
+# counts below, which account for both.
+MLIR_INPUT_F64 = """\
+func.func @ret_twice_f64(%arg0: tensor<f64>) -> (tensor<f64>, tensor<f64>) {
+  %unused = stablehlo.constant dense<0> : tensor<i32>
+  func.return %arg0, %arg0 : tensor<f64>, tensor<f64>
+}
+"""
+
+# Single (non-doubled) f64 return -- the exact shape of the bug found via
+# null_test_return_pairs_noop.py on real hardware: substitution used to be
+# decided per-operand from "1st or 2nd occurrence seen so far" with no
+# check on the TOTAL occurrence count, so a value returned exactly once
+# also hit "1st occurrence" and got wrongly substituted with hi alone,
+# dropping lo. This case must produce IDENTICAL op counts under
+# DS_RETURN_PAIRS=1 and unset -- if it doesn't, the single-return case is
+# incorrectly being treated as a pair.
+MLIR_INPUT_F64_SINGLE = """\
+func.func @ret_once_f64(%arg0: tensor<f64>) -> tensor<f64> {
+  %unused = stablehlo.constant dense<0> : tensor<i32>
+  func.return %arg0 : tensor<f64>
 }
 """
 # The dead %unused i32 constant above is not arithmetic significant -- it
@@ -146,6 +177,10 @@ def main():
 
     default_out = run_pass(opt_binary, MLIR_INPUT, return_pairs=False)
     pairs_out = run_pass(opt_binary, MLIR_INPUT, return_pairs=True)
+    default_out_f64 = run_pass(opt_binary, MLIR_INPUT_F64, return_pairs=False)
+    pairs_out_f64 = run_pass(opt_binary, MLIR_INPUT_F64, return_pairs=True)
+    single_default_f64 = run_pass(opt_binary, MLIR_INPUT_F64_SINGLE, return_pairs=False)
+    single_pairs_f64 = run_pass(opt_binary, MLIR_INPUT_F64_SINGLE, return_pairs=True)
 
     failures = []
 
@@ -179,19 +214,107 @@ def main():
             "pairs mode: expected 2 distinct SSA values (hi, lo), got {}".format(ops_pairs)
         )
 
+    # --- f64 argument, DS_RETURN_PAIRS unset: emitFromFloat's f64 split (3
+    # converts -- hi=convert(v,f32), hi_as_f64=convert(hi,f64),
+    # lo=convert(diff,f32) -- + 1 subtract, once) plus two independent
+    # emitToFloat recombinations (4 converts + 2 adds) -- unchanged by this
+    # feature.
+    n_convert_default_f64 = count_ops(default_out_f64, "convert")
+    n_add_default_f64 = count_ops(default_out_f64, "add")
+    n_sub_default_f64 = count_ops(default_out_f64, "subtract")
+    if n_convert_default_f64 != 7:
+        failures.append("f64 default mode: expected 7 stablehlo.convert (3 split + 4 recombine), "
+                         "got {}".format(n_convert_default_f64))
+    if n_add_default_f64 != 2:
+        failures.append("f64 default mode: expected 2 stablehlo.add, got {}".format(n_add_default_f64))
+    if n_sub_default_f64 != 1:
+        failures.append("f64 default mode: expected 1 stablehlo.subtract (split), got {}".format(
+            n_sub_default_f64))
+    ops_default_f64 = extract_return_operands(default_out_f64)
+    if len(ops_default_f64) != 2 or ops_default_f64[0] == ops_default_f64[1]:
+        failures.append(
+            "f64 default mode: expected 2 distinct SSA names from two independent "
+            "recombinations, got {}".format(ops_default_f64)
+        )
+
+    # --- f64 argument, DS_RETURN_PAIRS=1: split still happens (3 converts +
+    # 1 subtract, unrelated to this flag), but return-time recombination is
+    # replaced by widening hi/lo to f64 directly -- 2 more converts, 0 adds,
+    # for a total of 5 converts, 0 adds, 1 subtract. This is the exact new
+    # code path added for exp5_f64_reduction_bisection.py.
+    n_convert_pairs_f64 = count_ops(pairs_out_f64, "convert")
+    n_add_pairs_f64 = count_ops(pairs_out_f64, "add")
+    n_sub_pairs_f64 = count_ops(pairs_out_f64, "subtract")
+    if n_convert_pairs_f64 != 5:
+        failures.append("f64 pairs mode: expected 5 stablehlo.convert (3 split + 2 widen), "
+                         "got {}".format(n_convert_pairs_f64))
+    if n_add_pairs_f64 != 0:
+        failures.append("f64 pairs mode: expected 0 stablehlo.add, got {}".format(n_add_pairs_f64))
+    if n_sub_pairs_f64 != 1:
+        failures.append("f64 pairs mode: expected 1 stablehlo.subtract (split), got {}".format(
+            n_sub_pairs_f64))
+    ops_pairs_f64 = extract_return_operands(pairs_out_f64)
+    if len(ops_pairs_f64) != 2 or ops_pairs_f64[0] == ops_pairs_f64[1]:
+        failures.append(
+            "f64 pairs mode: expected 2 distinct SSA values (widened hi, widened lo), "
+            "got {}".format(ops_pairs_f64)
+        )
+
+    # --- f64 SINGLE (non-doubled) return: op counts under DS_RETURN_PAIRS=1
+    # must be IDENTICAL to unset -- this is the exact regression guard for
+    # the fixed bug (see DsTransformPass.cpp's func.return comment). Split
+    # (3 converts + 1 subtract) + emitToFloat recombination (2 converts +
+    # 1 add) = 5 converts, 1 add, 1 subtract, for BOTH modes.
+    n_convert_single_default = count_ops(single_default_f64, "convert")
+    n_add_single_default = count_ops(single_default_f64, "add")
+    n_sub_single_default = count_ops(single_default_f64, "subtract")
+    n_convert_single_pairs = count_ops(single_pairs_f64, "convert")
+    n_add_single_pairs = count_ops(single_pairs_f64, "add")
+    n_sub_single_pairs = count_ops(single_pairs_f64, "subtract")
+    if (n_convert_single_default, n_add_single_default, n_sub_single_default) != (5, 1, 1):
+        failures.append(
+            "f64 single-return default mode: expected (5 converts, 1 add, 1 subtract), "
+            "got ({}, {}, {})".format(n_convert_single_default, n_add_single_default,
+                                       n_sub_single_default)
+        )
+    if (n_convert_single_pairs, n_add_single_pairs, n_sub_single_pairs) != \
+       (n_convert_single_default, n_add_single_default, n_sub_single_default):
+        failures.append(
+            "f64 single-return: DS_RETURN_PAIRS=1 must be a no-op here (op counts must "
+            "match the default-mode counts exactly) -- default=({}, {}, {}) convert/add/"
+            "subtract, pairs=({}, {}, {}). A mismatch means a single-return value is "
+            "being incorrectly treated as a doubled pair (the bug this test exists to "
+            "catch).".format(n_convert_single_default, n_add_single_default,
+                              n_sub_single_default, n_convert_single_pairs,
+                              n_add_single_pairs, n_sub_single_pairs)
+        )
+
     if failures:
         print("FAIL:")
         for f in failures:
             print("  - {}".format(f))
         print("\n--- default-mode (DS_RETURN_PAIRS unset) output ---\n" + default_out)
         print("\n--- pairs-mode (DS_RETURN_PAIRS=1) output ---\n" + pairs_out)
+        print("\n--- f64 default-mode output ---\n" + default_out_f64)
+        print("\n--- f64 pairs-mode output ---\n" + pairs_out_f64)
+        print("\n--- f64 single-return default-mode output ---\n" + single_default_f64)
+        print("\n--- f64 single-return pairs-mode output ---\n" + single_pairs_f64)
         return 1
 
-    print("PASS: DS_RETURN_PAIRS structural test (3 checks x 2 modes, all as expected)")
-    print("  default: {} converts, {} adds, return={}".format(
+    print("PASS: DS_RETURN_PAIRS structural test (doubled-return x 2 dtypes, "
+          "plus single-return f64 no-op regression guard, all as expected)")
+    print("  f32 default: {} converts, {} adds, return={}".format(
         n_convert_default, n_add_default, ops_default))
-    print("  pairs:   {} converts, {} adds, return={}".format(
+    print("  f32 pairs:   {} converts, {} adds, return={}".format(
         n_convert_pairs, n_add_pairs, ops_pairs))
+    print("  f64 default: {} converts, {} adds, {} subtracts, return={}".format(
+        n_convert_default_f64, n_add_default_f64, n_sub_default_f64, ops_default_f64))
+    print("  f64 pairs:   {} converts, {} adds, {} subtracts, return={}".format(
+        n_convert_pairs_f64, n_add_pairs_f64, n_sub_pairs_f64, ops_pairs_f64))
+    print("  f64 single-return default: {} converts, {} adds, {} subtracts".format(
+        n_convert_single_default, n_add_single_default, n_sub_single_default))
+    print("  f64 single-return pairs:   {} converts, {} adds, {} subtracts".format(
+        n_convert_single_pairs, n_add_single_pairs, n_sub_single_pairs))
     return 0
 
 
