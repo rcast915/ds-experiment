@@ -16,6 +16,8 @@
 //   stablehlo.multiply  → ds_mul  (two_prod + two_sum sequences)
 //   stablehlo.divide    → ds_div  (ported from double_binary32_div)
 //   stablehlo.sqrt      → ds_sqrt (ported from double_binary32_sqrt)
+//   stablehlo.exponential → ds_exp (ported from double-single-libm's expds)
+//   stablehlo.log       → ds_log  (ported from double-single-libm's logds)
 //   stablehlo.negate    → ds_negate (negate both components)
 //   stablehlo.abs       → ds_abs  (conditional negate, ported from
 //                         double-single-lib's double_binary32_fabs)
@@ -26,8 +28,9 @@
 //   func entry args     → split into (hi, lo) via emitFromFloat
 //   func return values  → recombined via emitToFloat
 //
-// Ops in this table other than add/sub/mul/div/sqrt/negate/abs/compare/
-// select/maximum/minimum, dot_general, and reduce are NOT DS-transformed:
+// Ops in this table other than add/sub/mul/div/sqrt/exp/log/negate/abs/
+// compare/select/maximum/minimum, dot_general, and reduce are NOT
+// DS-transformed:
 // a DS-tracked operand flowing into one of them silently reverts to
 // native f32 precision from that point on. Set DS_WARN_UNSUPPORTED=1 to
 // have the pass report these to stderr as they're encountered (op name +
@@ -42,6 +45,12 @@
 // emitDsDiv also includes one deliberate correction beyond a literal
 // port (a dropped TwoProd residual term, confirmed to be a genuine bug
 // in the reference rather than a design choice) -- see its comment.
+//
+// exp/log ported from double-single-libm (expds in exp.c, logds in log.c);
+// their lookup tables are compiled in from libmds/exp_table.h and
+// libmds/log_table.h, copied unmodified from that library. See emitDsExp
+// and emitDsLog for how the library's branches, bit manipulation, and
+// table reads are expressed as StableHLO ops.
 //
 //===----------------------------------------------------------------------===//
 
@@ -69,9 +78,16 @@ struct PassPluginLibraryInfo {
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/DenseMap.h"
 
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <utility>
+
+// double-single-libm's table headers only need this typedef (libmds.h).
+typedef float __libmds_binary32_t;
+#include "libmds/exp_table.h"
+#include "libmds/log_table.h"
 
 using namespace mlir;
 
@@ -97,12 +113,32 @@ static RankedTensorType toF32Type(RankedTensorType t) {
 // return (hi, lo) pairs.  They expand directly to stablehlo ops — no custom
 // calls — so XLA sees and can fuse the arithmetic.
 
+// True if v is a constant, or a convert/broadcast of one -- i.e. something
+// XLA's constant folding will turn into a plain constant.
+static bool isConstantLike(Value v) {
+    while (Operation* def = v.getDefiningOp()) {
+        if (isa<stablehlo::ConstantOp>(def)) return true;
+        if (!isa<stablehlo::ConvertOp>(def) &&
+            !isa<stablehlo::BroadcastInDimOp>(def)) return false;
+        v = def->getOperand(0);
+    }
+    return false;
+}
+
 // two_sum(a, b) → (s, e)
 //   s  = a + b
 //   bb = s - a
 //   e  = (a - (s - bb)) + (b - bb)
+//
+// If a is a constant and b is not, the operands are swapped first. TwoSum
+// is symmetric and error-free, so (s, e) is the same either way, but
+// `(b + C) - C` is a shape XLA's algebraic simplifier may reassociate to
+// `b + (C - C)`, which would replace bb by b and lose the rounding error
+// this sequence exists to capture. Subtracting the non-constant operand
+// keeps the sequence out of that pattern.
 static std::pair<Value, Value> emitTwoSum(OpBuilder& bld, Location loc,
                                            Value a, Value b) {
+    if (isConstantLike(a) && !isConstantLike(b)) std::swap(a, b);
     Value s  = bld.create<stablehlo::AddOp>(loc, a, b);
     Value bb = bld.create<stablehlo::SubtractOp>(loc, s, a);
     Value e  = bld.create<stablehlo::AddOp>(loc,
@@ -261,9 +297,9 @@ static std::pair<Value, Value> emitDsMul(OpBuilder& bld, Location loc,
 // does not silently contract separate multiply+subtract StableHLO ops
 // into fma.rn.f32, so there's no risk of the Veltkamp sequence being
 // "helpfully" corrupted into something resembling the library's FMA path
-// (which would round differently) -- see also the note on Sterbenz-style
-// subtractions being an elevated-simplifier-risk sequence, same category
-// as the TwoSum residual chain Experiment 2b already checks.
+// (which would round differently). Sterbenz-style subtractions are an
+// elevated-simplifier-risk sequence, same category as the TwoSum residual
+// chain.
 static std::pair<Value, Value> emitDsDiv(OpBuilder& bld, Location loc,
                                           Value a_hi, Value a_lo,
                                           Value b_hi, Value b_lo) {
@@ -407,6 +443,395 @@ static Value emitDsCompare(OpBuilder& bld, Location loc,
                bld.create<stablehlo::AndOp>(loc, hiEq, loCmp));
 }
 
+// ── exp / log (ported from double-single-libm) ───────────────────────────────
+//
+// The helpers below mirror double-single-libm's libmds_internal.h building
+// blocks one-for-one (the _2_xy suffix is the library's own naming: result
+// is a double-word, operands are single (1) or double (2) words). They are
+// kept separate from emitDsAdd/emitDsMul above, which implement different
+// sequences, so that emitDsExp/emitDsLog evaluate exactly what expds/logds
+// evaluate.
+//
+// Constant operands follow the same rule as emitTwoSum: a sequence of the
+// form `(x + C) - C` is never emitted, since XLA may fold it to x. Where
+// the library has one (the shifter trick's `k = ssxh - SHIFTER`, and a
+// fast_two_sum whose leading operand is a polynomial coefficient), an
+// equivalent that computes the same value is used and noted at that step.
+//
+// Three library mechanisms have no direct StableHLO equivalent:
+//   - __libmds_mul_2_11 uses a hardware FMA. emitTwoProd (Veltkamp split)
+//     is substituted, for the reason given in emitDsDiv's comment. Both
+//     produce the exact product error, and every product in exp/log has
+//     operands of bounded magnitude, so the split cannot overflow.
+//   - Data-dependent branches (special cases, log's zh >= sqrt(2) step)
+//     become stablehlo.select: both arms are computed for every element
+//     and the special-case result overrides the main path at the end.
+//   - Float/int reinterpretation and table reads become
+//     stablehlo.bitcast_convert, integer shift/and ops on i32 tensors, and
+//     stablehlo.gather from a constant 1-D table.
+
+// __libmds_add_2_12: a + (bh, bl)
+static std::pair<Value, Value> emitAdd212(OpBuilder& bld, Location loc,
+                                           Value a, Value bh, Value bl) {
+    auto [t1h, t1l] = emitTwoSum(bld, loc, a, bh);
+    Value t2 = bld.create<stablehlo::AddOp>(loc, t1l, bl);
+    return emitFastTwoSum(bld, loc, t1h, t2);
+}
+
+// __libmds_add_2_22: (ah, al) + (bh, bl)
+static std::pair<Value, Value> emitAdd222(OpBuilder& bld, Location loc,
+                                           Value ah, Value al,
+                                           Value bh, Value bl) {
+    auto [t1h, t1l] = emitTwoSum(bld, loc, ah, bh);
+    Value t2 = bld.create<stablehlo::AddOp>(loc, al, bl);
+    Value t3 = bld.create<stablehlo::AddOp>(loc, t1l, t2);
+    return emitFastTwoSum(bld, loc, t1h, t3);
+}
+
+// __libmds_mul_2_12: a * (bh, bl)
+static std::pair<Value, Value> emitMul212(OpBuilder& bld, Location loc,
+                                           Value a, Value bh, Value bl) {
+    auto [t1h, t1l] = emitTwoProd(bld, loc, a, bh);
+    Value t2 = bld.create<stablehlo::MulOp>(loc, a, bl);
+    Value t3 = bld.create<stablehlo::AddOp>(loc, t1l, t2);
+    return emitFastTwoSum(bld, loc, t1h, t3);
+}
+
+// __libmds_mul_2_22: (ah, al) * (bh, bl)
+static std::pair<Value, Value> emitMul222(OpBuilder& bld, Location loc,
+                                           Value ah, Value al,
+                                           Value bh, Value bl) {
+    auto [t1h, t1l] = emitTwoProd(bld, loc, ah, bh);
+    Value t2 = bld.create<stablehlo::MulOp>(loc, ah, bl);
+    Value t3 = bld.create<stablehlo::MulOp>(loc, al, bh);
+    Value t4 = bld.create<stablehlo::AddOp>(loc, t2, t3);
+    Value t5 = bld.create<stablehlo::AddOp>(loc, t4, t1l);
+    return emitTwoSum(bld, loc, t1h, t5);
+}
+
+// The i32 tensor type with the same shape as a float tensor value.
+static RankedTensorType toI32Type(Value ref) {
+    auto ty = cast<RankedTensorType>(ref.getType());
+    return RankedTensorType::get(ty.getShape(),
+                                 IntegerType::get(ty.getContext(), 32));
+}
+
+// emitISplat: an i32 constant with every element equal to `scalar`.
+static Value emitISplat(OpBuilder& bld, Location loc, RankedTensorType i32Ty,
+                        int32_t scalar) {
+    auto attr = DenseElementsAttr::get(
+        i32Ty, APInt(32, static_cast<uint64_t>(static_cast<int64_t>(scalar)),
+                     /*isSigned=*/true));
+    return bld.create<stablehlo::ConstantOp>(loc, attr);
+}
+
+// __libmds_two_pow_normal: 2^k as f32, for an i32 tensor k in the normal
+// exponent range, built as the bit pattern (127 + k) << 23.
+static Value emitTwoPow(OpBuilder& bld, Location loc, Value k, Type f32Ty) {
+    auto i32Ty = cast<RankedTensorType>(k.getType());
+    Value biased = bld.create<stablehlo::AddOp>(loc,
+                       emitISplat(bld, loc, i32Ty, 127), k);
+    Value bits = bld.create<stablehlo::ShiftLeftOp>(loc, biased,
+                     emitISplat(bld, loc, i32Ty, 23));
+    return bld.create<stablehlo::BitcastConvertOp>(loc, f32Ty, bits);
+}
+
+// The biased exponent field of an f32 tensor, minus the bias, as i32.
+static Value emitExponentField(OpBuilder& bld, Location loc, Value x) {
+    auto i32Ty = toI32Type(x);
+    Value bits = bld.create<stablehlo::BitcastConvertOp>(loc, i32Ty, x);
+    Value shifted = bld.create<stablehlo::ShiftRightLogicalOp>(loc, bits,
+                        emitISplat(bld, loc, i32Ty, 23));
+    Value field = bld.create<stablehlo::AndOp>(loc, shifted,
+                      emitISplat(bld, loc, i32Ty, 0xff));
+    return bld.create<stablehlo::SubtractOp>(loc, field,
+               emitISplat(bld, loc, i32Ty, 127));
+}
+
+// Split an i32 tensor n into (n >> 1, n - (n >> 1)), so that 2^n can be
+// applied as two multiplications by normal powers of two.
+static std::pair<Value, Value> emitHalveExponent(OpBuilder& bld, Location loc,
+                                                  Value n) {
+    auto i32Ty = cast<RankedTensorType>(n.getType());
+    Value n1 = bld.create<stablehlo::ShiftRightArithmeticOp>(loc, n,
+                   emitISplat(bld, loc, i32Ty, 1));
+    Value n2 = bld.create<stablehlo::SubtractOp>(loc, n, n1);
+    return {n1, n2};
+}
+
+// table[idx], elementwise: `idx` is an i32 tensor of any static shape and
+// the result is an f32 tensor of the same shape. Emitted as a
+// stablehlo.gather of size-1 slices from a rank-1 constant, with the
+// index-vector dimension implied (index_vector_dim == rank(idx)), so no
+// reshape of idx is needed.
+static Value emitTableLookup(OpBuilder& bld, Location loc,
+                              ArrayRef<float> table, Value idx, Type f32Ty) {
+    auto idxTy = cast<RankedTensorType>(idx.getType());
+    const int64_t tableShape[] = {static_cast<int64_t>(table.size())};
+    auto tableTy = RankedTensorType::get(
+        tableShape, Float32Type::get(idxTy.getContext()));
+    Value tableCst = bld.create<stablehlo::ConstantOp>(
+        loc, DenseElementsAttr::get(tableTy, table));
+    const int64_t dim0[] = {0};
+    const int64_t sliceSizes[] = {1};
+    ArrayRef<int64_t> none;
+    auto dimNumbers = stablehlo::GatherDimensionNumbersAttr::get(
+        idxTy.getContext(),
+        /*offsetDims=*/none,
+        /*collapsedSliceDims=*/dim0,
+        /*operandBatchingDims=*/none,
+        /*startIndicesBatchingDims=*/none,
+        /*startIndexMap=*/dim0,
+        /*indexVectorDim=*/idxTy.getRank());
+    return bld.create<stablehlo::GatherOp>(
+        loc, f32Ty, tableCst, idx, dimNumbers,
+        bld.getDenseI64ArrayAttr(sliceSizes), bld.getBoolAttr(false));
+}
+
+// ds_exp((x_hi, x_lo)) → (out_hi, out_lo)
+// Ported from double-single-libm's expds (exp.c); the step comments use
+// that file's variable names. Outline:
+//   k    = nearestint(x_hi * 2^8/log(2))            [shifter trick]
+//   n    = floor(k / 2^8),  idx = k - n * 2^8        [0 <= idx <= 255]
+//   r    = x - k * 2^-8 * log(2)                     [log(2) in 6 chunks]
+//   p    = polynomial approximating e^rh             [degree 4]
+//   w    = table[idx] * p * (1 + rl)                 [table = 2^(idx/2^8)]
+//   out  = 2^n * w                                   [two scalings]
+//
+// Special cases, in the library's priority order, each returning the same
+// value in both components: NaN → NaN, +Inf → +Inf, -Inf → 0, sure
+// overflow → +Inf, sure complete underflow → 0. The library tests xh, xl,
+// and xh + xl for NaN separately; the sum alone is tested here, since it
+// is NaN whenever either word is.
+static std::pair<Value, Value> emitDsExp(OpBuilder& bld, Location loc,
+                                          Value xh, Value xl) {
+    using CD = stablehlo::ComparisonDirection;
+    Type f32Ty = xh.getType();
+    auto i32Ty = toI32Type(xh);
+    auto F = [&](float v) { return emitSplat(bld, loc, xh, v); };
+    auto I = [&](int32_t v) { return emitISplat(bld, loc, i32Ty, v); };
+    auto add = [&](Value a, Value b) -> Value {
+        return bld.create<stablehlo::AddOp>(loc, a, b); };
+    auto sub = [&](Value a, Value b) -> Value {
+        return bld.create<stablehlo::SubtractOp>(loc, a, b); };
+    auto mul = [&](Value a, Value b) -> Value {
+        return bld.create<stablehlo::MulOp>(loc, a, b); };
+    auto cmp = [&](Value a, Value b, CD dir) -> Value {
+        return bld.create<stablehlo::CompareOp>(loc, a, b, dir); };
+    auto lor = [&](Value a, Value b) -> Value {
+        return bld.create<stablehlo::OrOp>(loc, a, b); };
+    auto land = [&](Value a, Value b) -> Value {
+        return bld.create<stablehlo::AndOp>(loc, a, b); };
+    auto sel = [&](Value c, Value a, Value b) -> Value {
+        return bld.create<stablehlo::SelectOp>(loc, c, a, b); };
+
+    // kint = nearestint(xh * 2^8/log(2)): the low 18 bits of the shifted
+    // sum's significand, sign-extended. The library also forms the same
+    // integer as a float, k = ssxh - SHIFTER; here k is converted from
+    // kint instead, which is exact and gives the identical value.
+    Value ssxh = add(mul(xh, F(0x1.715476p8f)), F(0x1.8p23f));
+    Value ssxhbits = bld.create<stablehlo::BitcastConvertOp>(loc, i32Ty, ssxh);
+    Value kint = bld.create<stablehlo::ShiftRightArithmeticOp>(loc,
+                     bld.create<stablehlo::ShiftLeftOp>(loc, ssxhbits, I(14)),
+                     I(14));
+    Value k   = bld.create<stablehlo::ConvertOp>(loc, f32Ty, kint);
+    Value n   = bld.create<stablehlo::ShiftRightArithmeticOp>(loc, kint, I(8));
+    Value idx = sub(kint, bld.create<stablehlo::ShiftLeftOp>(loc, n, I(8)));
+
+    // rh + rl ~= xh - k * 2^-8 * log(2) + xl. Each chunk of -2^-8 * log(2)
+    // has 8 significant bits, so every k * chunk product is exact.
+    static const float chunks[6] = {
+        -0x1.62p-9f, -0x1.c8p-18f, -0x1.8p-28f,
+        0x1.06p-37f, -0x1.dp-48f, 0x1.0cp-57f};
+    Value rth = add(xh, mul(k, F(chunks[0])));   // rt1, Sterbenz
+    Value rtl[5];                                // rt2l .. rt6l
+    for (int i = 1; i < 6; ++i) {
+        auto [h, l] = emitTwoSum(bld, loc, rth, mul(k, F(chunks[i])));
+        rth = h;
+        rtl[i - 1] = l;
+    }
+    Value rt7 = add(add(add(add(add(rtl[4], rtl[3]), rtl[2]), rtl[1]),
+                        rtl[0]), xl);
+    auto [rh, rl] = emitTwoSum(bld, loc, rth, rt7);
+
+    // ph + pl ~= e^rh. The library's first step is fast_two_sum(c2, q);
+    // emitTwoSum returns the same pair without subtracting the constant.
+    Value q = mul(rh, add(F(0x1.555558p-3f), mul(rh, F(0x1.55555cp-5f))));
+    auto [pt1h, pt1l] = emitTwoSum(bld, loc, F(0x1p-1f), q);
+    auto [m2h, m2l]   = emitMul212(bld, loc, rh, pt1h, pt1l);
+    auto [pt2h, pt2l] = emitAdd212(bld, loc, F(1.0f), m2h, m2l);
+    auto [m1h, m1l]   = emitMul212(bld, loc, rh, pt2h, pt2l);
+    auto [ph, pl]     = emitAdd212(bld, loc, F(1.0f), m1h, m1l);
+
+    // th + tl = 2^(idx * 2^-8)
+    Value th = emitTableLookup(bld, loc, __expds_table_hi, idx, f32Ty);
+    Value tl = emitTableLookup(bld, loc, __expds_table_lo, idx, f32Ty);
+
+    // wh + wl = (th + tl) * ((ph + pl) + (ph + pl) * rl)
+    auto [qh, ql] = emitMul212(bld, loc, rl, ph, pl);
+    auto [zh, zl] = emitAdd222(bld, loc, ph, pl, qh, ql);
+    auto [wh, wl] = emitMul222(bld, loc, th, tl, zh, zl);
+
+    // 2^n * (wh + wl), as s1 * (s2 * w) so that neither power of two
+    // leaves the normal range.
+    auto [n1, n2] = emitHalveExponent(bld, loc, n);
+    Value s1 = emitTwoPow(bld, loc, n1, f32Ty);
+    Value s2 = emitTwoPow(bld, loc, n2, f32Ty);
+    Value resh = mul(s1, mul(s2, wh));
+    Value resl = mul(s1, mul(s2, wl));
+
+    // Special cases.
+    Value sum   = add(xh, xl);
+    Value omega = F(0x1.fffffep127f);
+    Value zero  = F(0.0f);
+    Value isNaN    = cmp(sum, sum, CD::NE);
+    Value isPosInf = cmp(sum, omega, CD::GT);
+    Value isNegInf = cmp(sum, F(-0x1.fffffep127f), CD::LT);
+    Value ovHi = F(0x1.62e43p6f);
+    Value unHi = F(-0x1.9fe36ap6f);
+    Value overflow = lor(cmp(xh, ovHi, CD::GT),
+                         land(cmp(xh, ovHi, CD::EQ),
+                              cmp(xl, F(-0x1.25c612p-22f), CD::GT)));
+    Value underflow = lor(cmp(xh, unHi, CD::LT),
+                          land(cmp(xh, unHi, CD::EQ),
+                               cmp(xl, F(0x1.d32c42p-18f), CD::LT)));
+    Value passThrough = lor(isNaN, isPosInf);    // result is xh + xl itself
+    Value special = sel(passThrough, sum,
+                        sel(isNegInf, zero,
+                            sel(overflow,
+                                F(std::numeric_limits<float>::infinity()),
+                                zero)));
+    Value isSpecial = lor(lor(passThrough, isNegInf),
+                          lor(overflow, underflow));
+    return {sel(isSpecial, special, resh), sel(isSpecial, special, resl)};
+}
+
+// ds_log((x_hi, x_lo)) → (out_hi, out_lo)
+// Ported from double-single-libm's logds (log.c); the step comments use
+// that file's variable names. Outline:
+//   E      = floor(log2(x_hi)), then z = x * 2^-E, halved (and E
+//            incremented) if z_hi >= sqrt(2), so sqrt(2)/2 < z_hi < sqrt(2)
+//   i      = nearestint(2^8 * z_hi) - 181              [0 <= i <= 181]
+//   r      = w[i] * z - 1,  w[i] ~= 1/z_hi             [|r| <= 2^-8.496]
+//   out    = E * log(2) + (-log(w[i])) + p(r)          [p ~= log(1 + r)]
+//
+// Special cases, in the library's priority order: NaN → NaN, +Inf → +Inf,
+// -Inf → NaN, x_hi < 0 → NaN (each in both components), x_hi == 0 →
+// (-Inf, 0).
+//
+// DEVIATION FROM THE LIBRARY, deliberate: for x_hi == 0, logds's comment
+// says "Return -inf" but its code computes 1.0f / (0.0f * 0.0f), which is
+// +Inf. log(0) is -Inf, so -Inf is what this emits.
+//
+// Two mechanical differences that do not change any computed value: E is
+// converted to float with stablehlo.convert instead of the library's
+// bit-pattern trick (both are exact for |E| <= 150), and the table index
+// is clamped to 181, since inputs that take a special case still evaluate
+// the main path here and could otherwise index past the 182-entry tables.
+static std::pair<Value, Value> emitDsLog(OpBuilder& bld, Location loc,
+                                          Value xh, Value xl) {
+    using CD = stablehlo::ComparisonDirection;
+    Type f32Ty = xh.getType();
+    auto i32Ty = toI32Type(xh);
+    auto F = [&](float v) { return emitSplat(bld, loc, xh, v); };
+    auto I = [&](int32_t v) { return emitISplat(bld, loc, i32Ty, v); };
+    auto add = [&](Value a, Value b) -> Value {
+        return bld.create<stablehlo::AddOp>(loc, a, b); };
+    auto mul = [&](Value a, Value b) -> Value {
+        return bld.create<stablehlo::MulOp>(loc, a, b); };
+    auto cmp = [&](Value a, Value b, CD dir) -> Value {
+        return bld.create<stablehlo::CompareOp>(loc, a, b, dir); };
+    auto lor = [&](Value a, Value b) -> Value {
+        return bld.create<stablehlo::OrOp>(loc, a, b); };
+    auto sel = [&](Value c, Value a, Value b) -> Value {
+        return bld.create<stablehlo::SelectOp>(loc, c, a, b); };
+
+    // E = floor(log2(xh)) (__libmds_logb_finite_non_zero). xh may be
+    // subnormal, so xh is first scaled by 2^-E0 using its raw exponent
+    // field E0, and the exponent of the scaled value is added back.
+    Value e0 = emitExponentField(bld, loc, xh);
+    auto [g1, g2] = emitHalveExponent(bld, loc,
+                        bld.create<stablehlo::NegOp>(loc, e0));
+    Value ssx = mul(emitTwoPow(bld, loc, g2, f32Ty),
+                    mul(emitTwoPow(bld, loc, g1, f32Ty), xh));
+    Value E = add(e0, emitExponentField(bld, loc, ssx));
+
+    // zh + zl = 2^-E * (xh + xl), with 1 <= zh < 2.
+    auto [f1, f2] = emitHalveExponent(bld, loc,
+                        bld.create<stablehlo::NegOp>(loc, E));
+    Value s1 = emitTwoPow(bld, loc, f1, f32Ty);
+    Value s2 = emitTwoPow(bld, loc, f2, f32Ty);
+    Value zh = mul(s1, mul(s2, xh));
+    Value zl = mul(s1, mul(s2, xl));
+
+    // If zh >= sqrt(2): halve z and increment E.
+    Value half = F(0.5f);
+    Value upper = cmp(zh, F(0x1.6a09e8p0f), CD::GE);
+    zh = sel(upper, mul(zh, half), zh);
+    zl = sel(upper, mul(zl, half), zl);
+    E  = sel(upper, add(E, I(1)), E);
+
+    // i = nearestint(2^8 * zh) - 181, read from the low byte of the
+    // shifted sum's bit pattern.
+    Value sh  = add(mul(F(0x1.0p8f), zh), F(0x1.7ffe96p23f));
+    Value shb = bld.create<stablehlo::BitcastConvertOp>(loc, i32Ty, sh);
+    Value i   = bld.create<stablehlo::MinOp>(loc,
+                    bld.create<stablehlo::AndOp>(loc, shb, I(0xff)), I(181));
+
+    // rh + rl = w * (zh + zl) - 1
+    Value w = emitTableLookup(bld, loc, __logds_table_rcpr_z, i, f32Ty);
+    auto [wzh, wzl] = emitMul212(bld, loc, w, zh, zl);
+    auto [rh, rl]   = emitAdd212(bld, loc, F(-1.0f), wzh, wzl);
+
+    // th + tl ~= -log(w)
+    Value th = emitTableLookup(bld, loc, __logds_table_m_log_w_hi, i, f32Ty);
+    Value tl = emitTableLookup(bld, loc, __logds_table_m_log_w_lo, i, f32Ty);
+
+    // elh + ell = E * log(2), with log(2) in three chunks whose products
+    // with e are exact.
+    Value e = bld.create<stablehlo::ConvertOp>(loc, f32Ty, E);
+    Value elrh = mul(e, F(0x1.62e4p-1f));
+    Value elrm = mul(e, F(0x1.7f7cp-20f));
+    Value elrl = mul(e, F(0x1.1cf8p-36f));
+    auto [telh, tell] = emitFastTwoSum(bld, loc, elrh, elrm);
+    auto [elh, ell]   = emitFastTwoSum(bld, loc, telh, add(tell, elrl));
+
+    // ph + pl ~= log(1 + rh + rl): degree-5 Horner scheme in
+    // double-single, zero constant term, double-single coefficients for
+    // degrees 1 and 2.
+    auto [m4h, m4l] = emitMul212(bld, loc, F(0x1.970e1cp-3f), rh, rl);
+    auto [q4h, q4l] = emitAdd212(bld, loc, F(-0x1.000068p-2f), m4h, m4l);
+    auto [m3h, m3l] = emitMul222(bld, loc, rh, rl, q4h, q4l);
+    auto [q3h, q3l] = emitAdd212(bld, loc, F(0x1.555556p-2f), m3h, m3l);
+    auto [m2h, m2l] = emitMul222(bld, loc, rh, rl, q3h, q3l);
+    auto [q2h, q2l] = emitAdd222(bld, loc, F(-0x1p-1f), F(0x1.95ep-39f),
+                                 m2h, m2l);
+    auto [m1h, m1l] = emitMul222(bld, loc, rh, rl, q2h, q2l);
+    auto [q1h, q1l] = emitAdd222(bld, loc, F(0x1p0f), F(-0x1.8p-47f),
+                                 m1h, m1l);
+    auto [ph, pl]   = emitMul222(bld, loc, rh, rl, q1h, q1l);
+
+    // (elh + ell) + ((th + tl) + (ph + pl))
+    auto [gh, gl]     = emitAdd222(bld, loc, th, tl, ph, pl);
+    auto [resh, resl] = emitAdd222(bld, loc, elh, ell, gh, gl);
+
+    // Special cases.
+    Value sum  = add(xh, xl);
+    Value zero = F(0.0f);
+    Value nan  = F(std::numeric_limits<float>::quiet_NaN());
+    Value passThrough = lor(cmp(sum, sum, CD::NE),               // NaN
+                            cmp(sum, F(0x1.fffffep127f), CD::GT)); // +Inf
+    Value invalid = lor(cmp(sum, F(-0x1.fffffep127f), CD::LT),   // -Inf
+                        cmp(xh, zero, CD::LT));                  // negative
+    Value isZero  = cmp(xh, zero, CD::EQ);
+    Value specialHi = sel(passThrough, sum,
+                          sel(invalid, nan,
+                              F(-std::numeric_limits<float>::infinity())));
+    Value specialLo = sel(passThrough, sum, sel(invalid, nan, zero));
+    Value isSpecial = lor(lor(passThrough, invalid), isZero);
+    return {sel(isSpecial, specialHi, resh), sel(isSpecial, specialLo, resl)};
+}
+
 // Split an f32/f64 tensor into a DS (hi, lo) pair.
 //   For f64: hi = float(v),  lo = float(v - double(hi))
 //   For f32: hi = v,         lo = 0  (already exact)
@@ -423,7 +848,27 @@ static std::pair<Value, Value> emitFromFloat(OpBuilder& bld, Location loc,
     }
 
     // f64 path
-    Value hi        = bld.create<stablehlo::ConvertOp>(loc, f32Ty, v);
+    //
+    // hi is the narrowed value BEHIND an optimization barrier, and every
+    // use of hi goes through that barrier. XLA folds
+    // convert(convert(v, f32), f64) straight back to v -- narrow-then-widen
+    // treated as an identity, which it is not unless v already fits in
+    // f32. The fold is a peephole on the convert-feeds-convert adjacency
+    // itself, so the barrier has to sit between the two converts; one
+    // placed after the widening convert is too late.
+    //
+    // Two places widen hi back to f64, and both need the barrier:
+    //   - here, for lo = v - f64(hi). Folded, this becomes v - v = 0.
+    //   - emitToFloat at func.return, for f64(hi) + f64(lo). Folded, this
+    //     becomes v + f64(lo): the result is off by lo, an f32-level error.
+    //     Observed on GPU when only the first use was barriered: `x + 0.0`
+    //     on f64 inputs came back accurate to 2^-24, and the small helper
+    //     modules JAX compiles ahead of a jitted function (which the plugin
+    //     also transforms) shifted their f64 outputs by lo before the
+    //     user's function ever ran.
+    Value hi_raw = bld.create<stablehlo::ConvertOp>(loc, f32Ty, v);
+    Value hi = bld.create<stablehlo::OptimizationBarrierOp>(
+        loc, TypeRange{f32Ty}, ValueRange{hi_raw})->getResult(0);
     Value hi_as_f64 = bld.create<stablehlo::ConvertOp>(loc, ty, hi);
     Value diff      = bld.create<stablehlo::SubtractOp>(loc, v, hi_as_f64);
     Value lo        = bld.create<stablehlo::ConvertOp>(loc, f32Ty, diff);
@@ -622,6 +1067,35 @@ struct DsTransformPass
                 auto [a_hi, a_lo] = dsMap[sqrtOp.getOperand()];
                 auto [r_hi, r_lo] = emitDsSqrt(b, loc, a_hi, a_lo);
                 dsMap[sqrtOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.exponential ──────────────────────────────────────
+            // Ported from double-single-libm's expds -- see emitDsExp for
+            // the sequence and its special-case handling.
+            if (auto expOp = dyn_cast<stablehlo::ExpOp>(op)) {
+                if (!isFloatTensor(expOp.getResult())) continue;
+                if (!dsMap.count(expOp.getOperand())) continue;
+
+                auto [a_hi, a_lo] = dsMap[expOp.getOperand()];
+                auto [r_hi, r_lo] = emitDsExp(b, loc, a_hi, a_lo);
+                dsMap[expOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.log ──────────────────────────────────────────────
+            // Ported from double-single-libm's logds -- see emitDsLog for
+            // the sequence, its special-case handling, and the one
+            // deliberate deviation (log(0) is -Inf here).
+            if (auto logOp = dyn_cast<stablehlo::LogOp>(op)) {
+                if (!isFloatTensor(logOp.getResult())) continue;
+                if (!dsMap.count(logOp.getOperand())) continue;
+
+                auto [a_hi, a_lo] = dsMap[logOp.getOperand()];
+                auto [r_hi, r_lo] = emitDsLog(b, loc, a_hi, a_lo);
+                dsMap[logOp.getResult()] = {r_hi, r_lo};
                 toErase.push_back(op);
                 continue;
             }
@@ -868,19 +1342,19 @@ struct DsTransformPass
             // `hi` component and the second with its raw `lo` component --
             // skipping emitToFloat's recombination entirely for that pair
             // of operands -- so the caller can recombine in f64 on the host
-            // instead of losing precision to an f32 return (see
-            // ds_reeval/exp3_pair_accuracy.py and
-            // ds_reeval/test_return_pairs_structural.py).
+            // instead of losing precision to an f32 return (see the
+            // pair-accuracy sections of tests/test_ds_divide.py and
+            // tests/test_ds_sqrt.py).
             //
             // Two return-type cases, both handled without ever changing the
             // FuncOp's result-type signature or the function's arity as JAX
             // originally traced it (no risk of ill-typed IR either way):
             //   - f32-typed return (orig.getType() == hi.getType(), the
-            //     common case, e.g. Experiment 3's f32-input reduction):
+            //     common case, e.g. an f32-input reduction):
             //     substitute hi/lo directly -- they're already the right type.
             //   - f64-typed return (hi/lo are f32 but the declared return
-            //     type is f64, e.g. exp5_f64_reduction_bisection.py's
-            //     f64-input probes): substitute convert(hi, f64) and
+            //     type is f64, e.g. f64-input probes): substitute
+            //     convert(hi, f64) and
             //     convert(lo, f64) instead -- two separate f64-typed outputs,
             //     each an exact widening of one raw component, rather than
             //     their (lossy-at-output) sum. Added alongside the f64
@@ -916,8 +1390,8 @@ struct DsTransformPass
             // f64 has enough precision to represent lo's contribution
             // exactly, so a single f64 return silently losing lo is a
             // real, measurable correctness bug -- confirmed via a
-            // dedicated null test (null_test_return_pairs_noop.py)
-            // showing a single, non-doubled f64 return changed value
+            // dedicated null test showing a single, non-doubled f64
+            // return changed value
             // depending solely on whether DS_RETURN_PAIRS=1 was set,
             // which the documented design says should be impossible.
             // Fixed by counting each value's TOTAL occurrences across the
@@ -959,6 +1433,10 @@ struct DsTransformPass
                         }
                     }
                     if (!substitutedPair) {
+                        // A function argument returned untouched keeps its
+                        // original value: splitting and recombining it
+                        // would only round an f64 to DS precision.
+                        if (isa<BlockArgument>(orig)) continue;
                         Value combined = emitToFloat(rb, loc, hi, lo, orig.getType());
                         operand.set(combined);
                     }

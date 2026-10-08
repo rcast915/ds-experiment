@@ -296,8 +296,7 @@ def run_gpu_tests():
 
     def block(x):
         # Handles both a single array and a pytree of them (cmp_select_fn
-        # below returns a 3-tuple) -- matching paper/ds_reeval/common.py's
-        # block_until_ready helper.
+        # below returns a 3-tuple).
         if hasattr(x, "block_until_ready"):
             x.block_until_ready()
         else:
@@ -306,8 +305,8 @@ def run_gpu_tests():
         return x
 
     # ── 3a. negate: exact, no new rounding -- DS should match f64 truth to
-    # within the f32-return half-ulp floor (same output-quantization story
-    # as Experiment 3; negate itself introduces zero additional error).
+    # within the f32-return half-ulp floor (output quantization at the f32
+    # return; negate itself introduces zero additional error).
     @jax.jit
     def neg_fn(x):
         return -x

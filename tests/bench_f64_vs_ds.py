@@ -1,11 +1,14 @@
 """
 Float64 vs DS-f32 performance benchmark — the primary research result.
 
-On H100, cuBLAS f64 GEMM is ~30× slower than f32 (no tensor-core support).
-DS-f32 replaces each f64 op with DS arithmetic over two f32 values, keeping
-~48-bit precision while running at f32 hardware speed.  For matrix multiply
-this means 4 f32 GEMMs (~4× f32 cost) vs one f64 GEMM (~30× f32 cost): an
-expected 7–8× speedup over native f64 at near-f64 precision.
+On GPUs without native FP64 tensor cores (e.g. L40S), cuBLAS f64 GEMM runs
+on CUDA cores at ~1/64 of f32 throughput.  DS-f32 replaces each f64 op with
+DS arithmetic over two f32 values, keeping ~48-bit precision while running at
+f32 hardware speed.  For matrix multiply this means 4 f32 GEMMs (~4× f32
+cost) vs one f64 GEMM (~64× f32 cost): an expected 7–16× speedup over native
+f64 at near-f64 precision.  On HPC GPUs with native FP64 tensor cores (e.g.
+H100), f64 and DS-f32 run at comparable speed — the speedup is concentrated
+on consumer and professional GPUs without dedicated FP64 units.
 
 Benchmarks three operation classes, each with a f64 baseline (DS_BYPASS=1)
 and a DS-f32 run (plugin active), both with JAX_ENABLE_X64=1:
@@ -248,7 +251,8 @@ if __name__ == "__main__":
     print()
     print("Notes:")
     print("  speedup > 1 means DS-f32 is faster than native f64.")
-    print("  Matmul: H100 f64 GEMM has no tensor-core support (~30× slower")
-    print("    than f32). DS uses 4 f32 GEMMs, so expected speedup ≈ 7–8×.")
+    print("  Matmul: on GPUs without native FP64 tensor cores (e.g. L40S),")
+    print("    f64 GEMM runs at ~1/64 f32 throughput. DS uses 4 f32 GEMMs,")
+    print("    so expected speedup ≈ 7–16× over native f64.")
     print("  TFLOPS denominator = 2·N³ (standard matmul). DS runs 4 sub-")
     print("    matmuls, so true DS FLOPs ≈ 4× the standard count.")

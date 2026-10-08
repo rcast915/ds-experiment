@@ -38,7 +38,7 @@ double-single-lib's double_binary32_div WITH ONE DELIBERATE CORRECTION.
        margin), not DS_DIV_REL_ERR_BOUND -- DS's real, measurable
        advantage is checked in (b)/(c) and Section 1's lo != 0
        cross-check, where the corrected internal accuracy is observable.
-    b) Pair-accuracy variant (DS_RETURN_PAIRS=1): per Experiment 3's
+    b) Pair-accuracy variant (DS_RETURN_PAIRS=1): per the
        observable-vs-internal distinction, checks the *internal* (hi, lo)
        pair recombined in f64 on the host separately from the f32-return-
        quantized result. Uses a loose rel_tol (not DS_DIV_REL_ERR_BOUND)
@@ -320,8 +320,7 @@ def run_gpu_tests():
     # ── 3b. Pair-accuracy variant (DS_RETURN_PAIRS=1) ────────────────────────
     # Divide a cancellation-derived DS value (real lo channel) by a constant,
     # comparing the f32-return-quantized result against the raw pair
-    # recombined in f64 on the host -- same observable-vs-internal split as
-    # Experiment 3.
+    # recombined in f64 on the host (the observable-vs-internal split).
     return_pairs = os.environ.get("DS_RETURN_PAIRS", "") == "1"
     if return_pairs:
         @jax.jit

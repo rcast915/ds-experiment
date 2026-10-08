@@ -156,6 +156,218 @@ def ds_sqrt(ah, al):
     return fast_two_sum(t7, t8)
 
 
+# ── exp / log (ported from double-single-libm) ─────────────────────────────────
+#
+# Mirrors DsTransformPass.cpp's emitDsExp/emitDsLog, which were ported from
+# double-single-libm's expds (exp.c) and logds (log.c). The lookup tables are
+# parsed from the same headers the pass compiles in
+# (stablehlo_pass/libmds/*.h), so there is one copy of the table data.
+#
+# As with ds_div, the library's FMA-based __libmds_mul_2_11 is substituted
+# with two_prod (Veltkamp-split-based); both yield the exact product error,
+# so the results are the same wherever neither over/underflows.
+
+import re
+from pathlib import Path
+
+_LIBMDS_DIR = Path(__file__).resolve().parent.parent / "stablehlo_pass" / "libmds"
+_libmds_tables = {}
+
+
+def _libmds_table(header, name):
+    """Load one `static const __libmds_binary32_t name[N] = {...};` array."""
+    if name not in _libmds_tables:
+        text = (_LIBMDS_DIR / header).read_text()
+        m = re.search(re.escape(name) + r"\[(\d+)\]\s*=\s*\{(.*?)\};", text, re.S)
+        vals = [float.fromhex(v) for v in
+                re.findall(r"\)\s*(-?0x[0-9a-fA-F.]+p[-+]?\d+)f", m.group(2))]
+        assert len(vals) == int(m.group(1)), (name, len(vals))
+        _libmds_tables[name] = np.array(vals, dtype=np.float32)
+    return _libmds_tables[name]
+
+
+def _hexf(s):
+    return np.float32(float.fromhex(s))
+
+
+def _i32(v):
+    """Wrap a Python int to int32 two's-complement range."""
+    v &= 0xffffffff
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
+def _f32_bits(x):
+    return int(np.float32(x).view(np.int32))
+
+
+def _two_pow(k):
+    """__libmds_two_pow_normal: 2^k for k in the normal exponent range."""
+    return np.int32(_i32((127 + k) << 23)).view(np.float32)
+
+
+def _add_2_12(a, bh, bl):
+    t1h, t1l = two_sum(a, bh)
+    return fast_two_sum(t1h, np.float32(t1l + bl))
+
+
+def _add_2_22(ah, al, bh, bl):
+    t1h, t1l = two_sum(ah, bh)
+    t2 = np.float32(al + bl)
+    return fast_two_sum(t1h, np.float32(t1l + t2))
+
+
+def _mul_2_12(a, bh, bl):
+    t1h, t1l = two_prod(a, bh)
+    t2 = np.float32(a * bl)
+    return fast_two_sum(t1h, np.float32(t1l + t2))
+
+
+def _mul_2_22(ah, al, bh, bl):
+    t1h, t1l = two_prod(ah, bh)
+    t4 = np.float32(np.float32(ah * bl) + np.float32(al * bh))
+    return two_sum(t1h, np.float32(t4 + t1l))
+
+
+_EXP_OMEGA = _hexf("0x1.fffffep127")
+_EXP_OVERFLOW_HI = _hexf("0x1.62e43p6")
+_EXP_OVERFLOW_LO = _hexf("-0x1.25c612p-22")
+_EXP_UNDERFLOW_HI = _hexf("-0x1.9fe36ap6")
+_EXP_UNDERFLOW_LO = _hexf("0x1.d32c42p-18")
+_EXP_SCALED_RCPR_LOG_TWO = _hexf("0x1.715476p8")
+_EXP_SHIFTER = _hexf("0x1.8p23")
+_EXP_M_LOG_TWO_CHUNKS = [_hexf(s) for s in (
+    "-0x1.62p-9", "-0x1.c8p-18", "-0x1.8p-28",
+    "0x1.06p-37", "-0x1.dp-48", "0x1.0cp-57")]
+_EXP_POLY = [_hexf(s) for s in (
+    "0x1.0p0", "0x1.0p0", "0x1p-1", "0x1.555558p-3", "0x1.55555cp-5")]
+
+
+def ds_exp(xh, xl):
+    """Ported from double-single-libm's expds (exp.c)."""
+    xh = np.float32(xh); xl = np.float32(xl)
+    with np.errstate(invalid='ignore', over='ignore', under='ignore'):
+        s = np.float32(xh + xl)
+        if s != s or s > _EXP_OMEGA:
+            return s, s                      # NaN, +Inf
+        if s < -_EXP_OMEGA:
+            return np.float32(0.0), np.float32(0.0)
+        if xh > _EXP_OVERFLOW_HI or (xh == _EXP_OVERFLOW_HI and xl > _EXP_OVERFLOW_LO):
+            return np.float32(np.inf), np.float32(np.inf)
+        if xh < _EXP_UNDERFLOW_HI or (xh == _EXP_UNDERFLOW_HI and xl < _EXP_UNDERFLOW_LO):
+            return np.float32(0.0), np.float32(0.0)
+
+        # k = nearestint(xh * 2^8/log(2)) via the shifter trick.
+        ssxh = np.float32(np.float32(xh * _EXP_SCALED_RCPR_LOG_TWO) + _EXP_SHIFTER)
+        k = np.float32(ssxh - _EXP_SHIFTER)
+        kint = _i32(_f32_bits(ssxh) << 14) >> 14
+        n = kint >> 8
+        idx = kint - (n << 8)
+
+        # rh + rl ~= xh - k * 2^-8 * log(2) + xl
+        l2k = [np.float32(k * c) for c in _EXP_M_LOG_TWO_CHUNKS]
+        rth = np.float32(xh + l2k[0])        # Sterbenz
+        lows = []
+        for c in l2k[1:]:
+            rth, rtl = two_sum(rth, c)
+            lows.append(rtl)
+        rt7 = lows[4]
+        for rtl in (lows[3], lows[2], lows[1], lows[0], xl):
+            rt7 = np.float32(rt7 + rtl)
+        rh, rl = two_sum(rth, rt7)
+
+        # ph + pl ~= e^rh
+        q = np.float32(rh * np.float32(_EXP_POLY[3] + np.float32(rh * _EXP_POLY[4])))
+        pt1h, pt1l = fast_two_sum(_EXP_POLY[2], q)
+        pt2h, pt2l = _add_2_12(_EXP_POLY[1], *_mul_2_12(rh, pt1h, pt1l))
+        ph, pl = _add_2_12(_EXP_POLY[0], *_mul_2_12(rh, pt2h, pt2l))
+
+        th = _libmds_table("exp_table.h", "__expds_table_hi")[idx]
+        tl = _libmds_table("exp_table.h", "__expds_table_lo")[idx]
+
+        # (th + tl) * (ph + pl) * (1 + rl), then scale by 2^n in two steps.
+        qh, ql = _mul_2_12(rl, ph, pl)
+        zh, zl = _add_2_22(ph, pl, qh, ql)
+        wh, wl = _mul_2_22(th, tl, zh, zl)
+        n1 = n >> 1
+        s1 = _two_pow(n1); s2 = _two_pow(n - n1)
+        return np.float32(s1 * np.float32(s2 * wh)), np.float32(s1 * np.float32(s2 * wl))
+
+
+_LOG_OMEGA = _hexf("0x1.fffffep127")
+_LOG_SQRT_TWO = _hexf("0x1.6a09e8p0")
+_LOG_MOD_SHIFTER = _hexf("0x1.7ffe96p23")
+_LOG_TWO = [_hexf(s) for s in ("0x1.62e4p-1", "0x1.7f7cp-20", "0x1.1cf8p-36")]
+_LOG_C1 = (_hexf("0x1p0"), _hexf("-0x1.8p-47"))
+_LOG_C2 = (_hexf("-0x1p-1"), _hexf("0x1.95ep-39"))
+_LOG_C3 = _hexf("0x1.555556p-2")
+_LOG_C4 = _hexf("-0x1.000068p-2")
+_LOG_C5 = _hexf("0x1.970e1cp-3")
+
+
+def _logb(x):
+    """__libmds_logb_finite_non_zero: floor(log2(x)), subnormals included."""
+    E = ((_f32_bits(x) >> 23) & 0xff) - 127
+    G = -E
+    G1 = G >> 1
+    ssx = np.float32(_two_pow(G - G1) * np.float32(_two_pow(G1) * x))
+    return E + ((_f32_bits(ssx) >> 23) & 0xff) - 127
+
+
+def ds_log(xh, xl):
+    """Ported from double-single-libm's logds (log.c), WITH ONE DELIBERATE
+    CORRECTION: for xh == 0 the library's comment says "Return -inf" but
+    its code computes 1.0f / (0.0f * 0.0f) = +inf. This returns (-inf, 0),
+    the mathematically correct log(0), matching emitDsLog.
+    """
+    xh = np.float32(xh); xl = np.float32(xl)
+    with np.errstate(invalid='ignore', over='ignore', under='ignore'):
+        s = np.float32(xh + xl)
+        if s != s or s > _LOG_OMEGA:
+            return s, s                      # NaN, +Inf
+        if s < -_LOG_OMEGA or xh < 0.0:
+            return np.float32(np.nan), np.float32(np.nan)
+        if xh == 0.0:
+            return np.float32(-np.inf), np.float32(0.0)
+
+        # Scale so that log(xh + xl) = E*log(2) + log(zh + zl),
+        # sqrt(2)/2 < zh < sqrt(2).
+        E = _logb(xh)
+        F = -E
+        F1 = F >> 1
+        s1 = _two_pow(F1); s2 = _two_pow(F - F1)
+        zh = np.float32(s1 * np.float32(s2 * xh))
+        zl = np.float32(s1 * np.float32(s2 * xl))
+        if zh >= _LOG_SQRT_TWO:
+            zh = np.float32(zh * np.float32(0.5))
+            zl = np.float32(zl * np.float32(0.5))
+            E += 1
+
+        # i = nearestint(2^8 * zh) - 181, read from the shifted sum's low byte.
+        sh = np.float32(np.float32(np.float32(256.0) * zh) + _LOG_MOD_SHIFTER)
+        i = _f32_bits(sh) & 0xff
+
+        # rh + rl = w * (zh + zl) - 1 with w ~= 1/zh
+        w = _libmds_table("log_table.h", "__logds_table_rcpr_z")[i]
+        rh, rl = _add_2_12(np.float32(-1.0), *_mul_2_12(w, zh, zl))
+        th = _libmds_table("log_table.h", "__logds_table_m_log_w_hi")[i]
+        tl = _libmds_table("log_table.h", "__logds_table_m_log_w_lo")[i]
+
+        # elh + ell = E * log(2)
+        e = np.float32(E)
+        telh, tell = fast_two_sum(np.float32(e * _LOG_TWO[0]), np.float32(e * _LOG_TWO[1]))
+        elh, ell = fast_two_sum(telh, np.float32(tell + np.float32(e * _LOG_TWO[2])))
+
+        # ph + pl ~= log(1 + rh + rl), degree-5 Horner in double-single.
+        q4h, q4l = _add_2_12(_LOG_C4, *_mul_2_12(_LOG_C5, rh, rl))
+        q3h, q3l = _add_2_12(_LOG_C3, *_mul_2_22(rh, rl, q4h, q4l))
+        q2h, q2l = _add_2_22(*_LOG_C2, *_mul_2_22(rh, rl, q3h, q3l))
+        q1h, q1l = _add_2_22(*_LOG_C1, *_mul_2_22(rh, rl, q2h, q2l))
+        ph, pl = _mul_2_22(rh, rl, q1h, q1l)
+
+        gh, gl = _add_2_22(th, tl, ph, pl)
+        return _add_2_22(elh, ell, gh, gl)
+
+
 # ── Trivial / comparison ops (ported from double-single-lib) ───────────────────
 #
 # Mirrors DsTransformPass.cpp's emitDsAbs/emitDsCompare, which were ported

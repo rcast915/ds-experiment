@@ -27,7 +27,7 @@ double-single-lib's double_binary32_sqrt.
        advantage (internal precision, precision preserved through
        composition) is checked in (b), (c), and Section 1's lo != 0
        cross-check -- not asserted here as a "beats f32" claim.
-    b) Pair-accuracy variant (DS_RETURN_PAIRS=1): per Experiment 3's
+    b) Pair-accuracy variant (DS_RETURN_PAIRS=1): per the
        observable-vs-internal distinction, checks the *internal* (hi, lo)
        pair recombined in f64 on the host separately from the f32-return-
        quantized result.
@@ -254,7 +254,7 @@ def run_gpu_tests():
     # ── 3b. Pair-accuracy variant (DS_RETURN_PAIRS=1) ────────────────────────
     # sqrt of a cancellation-derived DS value (real lo channel), comparing
     # the f32-return-quantized result against the raw pair recombined in
-    # f64 on the host -- same observable-vs-internal split as Experiment 3.
+    # f64 on the host (the observable-vs-internal split).
     return_pairs = os.environ.get("DS_RETURN_PAIRS", "") == "1"
     if return_pairs:
         @jax.jit

@@ -14,7 +14,9 @@ Automatically transform float arithmetic in JAX/XLA programs to double-single (D
 
 **The claim:** DS-f32 achieves ~48-bit effective mantissa (vs f64's 53 bits) while running at approximately f32 hardware cost. On GPUs with poor or absent f64 support (consumer cards, mobile, embedded), this gives f64-class accuracy at f32 speed — a direct win. On HPC GPUs with native f64 units (H100), DS-f32 was measured to match f64 wall time while using only f32 arithmetic paths, giving f64-class accuracy with no performance penalty relative to f64.
 
-**Measured on H100 (2026-06-23):** DS-f32 runs within 10% of native f64 speed for element-wise ops and reductions, and within 15% for matmul at sizes up to 2048×2048. The H100 has native FP64 tensor cores (~51 TFLOPS PCIe), so f64 is competitive with f32 on this hardware; the speedup argument applies on GPUs without FP64 tensor core support.
+**Measured on H100 (2026-06-26, `h100_results.txt`):** DS-f32 runs within 10% of native f64 speed for element-wise ops and reductions at large sizes. For matmul, DS-f32 is within ~10% of f64 at 1024²–2048² and 1.13× faster than f64 at 2048×2048; at smaller sizes DS is slower (0.71× at 256²) due to 4 kernel launches vs 1 at latency-dominated sizes. The H100 has native FP64 tensor cores (~51 TFLOPS PCIe, confirmed: 48.6 TFLOPS measured at 2048²), so f64 is competitive with f32 on this hardware; the speedup argument applies on GPUs without FP64 tensor core support.
+
+**Measured on L40S / Bridges-2 (2026-06-26, `l40_results.txt`):** The L40S has no native FP64 tensor cores (~1/64 f32 throughput for f64). DS-f32 matmul is **up to 12.87× faster than native f64** at 2048×2048 (DS: ~18 TFLOPS vs f64: ~1.4 TFLOPS), while delivering the same numerical accuracy. All 3 test suites pass on L40S. Element-wise and reduction workloads show little speedup (memory-bandwidth-bound — both saturate bandwidth equally); the speedup is concentrated in compute-bound matmul where the f64 CUDA-core bottleneck is most severe.
 
 The mechanism: a PJRT proxy plugin intercepts JAX compile calls, runs a StableHLO IR pass that splits float arguments into DS pairs at function entry, replaces arithmetic with DS sequences, and recombines at function exit. Supports both f32 inputs (precision improvement) and f64 inputs (accuracy preservation at f32 cost).
 
@@ -24,11 +26,19 @@ The mechanism: a PJRT proxy plugin intercepts JAX compile calls, runs a StableHL
 
 ## Environment
 
-**Cluster:** Punakha HPC, node `hopper001`  
+### Punakha HPC (primary development)
+**Node:** `hopper001` · **GPU:** H100 (sm_9.0a)  
 **Host working directory:** `/o_home/racastaneda3/ds_experiment`  
 **Container working directory:** `/src/ds_experiment`  
 **Username:** `racastaneda3`  
 **Supervisor:** Dr. Moore (Shirley V.) | **IT contact:** Robert Corral
+
+### Bridges-2 / PSC (L40S testing, 2026-06-26)
+**GPU:** L40S (no native FP64 tensor cores)  
+**Project allocation:** `cis260064p` (`/ocean/projects/cis260064p`)  
+**Username:** `rcastane`  
+**Container:** Singularity/Apptainer — use `submit_l40s.sh` to pull image and run tests  
+**Image:** `docker://rcast915/ds-experiment:latest` (Docker Hub)
 
 **Get an interactive GPU node:**
 ```bash
@@ -92,6 +102,8 @@ python3 your_script.py
 ├── Dockerfile
 ├── build_docker.sh              # SLURM batch job for rebuilding the image
 ├── ds_setup.sh                  # Per-session setup script
+├── h100_results.txt             # Raw test suite output: H100 (2026-06-26) ← authoritative
+├── l40_results.txt              # Raw test suite output: L40S (2026-06-26) ← authoritative
 │
 ├── stablehlo_pass/              # MLIR/StableHLO DS pass (primary implementation)
 │   ├── DsTransformPass.cpp      # Inline DS pass — expands to native StableHLO ops
@@ -112,11 +124,16 @@ python3 your_script.py
 │   ├── ds_ref.py                # Pure-NumPy DS reference arithmetic (no JAX/CUDA)
 │   ├── test_dot_product.py      # Accuracy tests: numpy ref + MLIR structural + GPU numerical
 │   ├── test_matmul.py           # Accuracy tests: same structure
-│   ├── bench_dot_product.py     # Timing + GFLOPS: DS vs f32 via subprocess baseline
-│   └── bench_matmul.py          # Timing + TFLOPS: (A*A)@B and A@B suites
+│   ├── test_f64_ds.py           # Accuracy tests: f64 inputs via DS plugin
+│   ├── bench_dot_product.py     # Timing + GFLOPS: DS vs f32
+│   ├── bench_matmul.py          # Timing + TFLOPS: (A*A)@B and A@B suites
+│   └── bench_f64_vs_ds.py       # Timing: f64 baseline vs DS-f32 (primary research result)
 │
-├── python/                      # Earlier scripts (many target the FFI path)
+├── python/                      # Earlier scripts and experiment narrative records
 │   ├── test_pass_correctness.py # Original 3-test correctness suite (still valid)
+│   ├── ds_results_h100.txt      # Narrative: FFI-era GPU experiments on H100
+│   ├── ds_results_compiler_pass_h100.txt  # Narrative: compiler pass results on H100
+│   ├── ds_results_l40s.txt      # Narrative: compiler pass results on L40S
 │   └── [benchmark_*, plot_*, test_* scripts]
 │
 └── double_single_ray/           # Prior LLVM IR approach (reference/predecessor only)
@@ -138,12 +155,13 @@ cmake -GNinja -S cpp -B cpp/build && ninja -C cpp/build
 ## What Works ✅
 
 ### 1. Inline StableHLO Pass (`ds-transform`)
-Expands `stablehlo.add/sub/mul` into DS arithmetic (two_sum, Veltkamp split, two_prod) as native StableHLO ops. XLA sees and fuses the full expanded sequence.
+Expands `stablehlo.add/sub/mul` into DS arithmetic (two_sum, Veltkamp split, two_prod) as native StableHLO ops. XLA sees and fuses the full expanded sequence. Also handled: `divide`, `sqrt`, `negate`, `abs`, `compare`, `select`, `maximum`, `minimum` (ported from `double_single_ray/.../double-single-lib`) and `exponential`, `log` (ported from `double-single-libm`, see section 8).
 
 Pass pipeline (GPU):
 ```
 vhlo-to-version{target=1.16.3}
 vhlo-legalize-to-stablehlo        ← REQUIRED before ds-transform
+inline                            ← removes func.call boundaries (JAX outlines jnp.where)
 func.func(ds-transform)
 stablehlo-legalize-to-vhlo
 ```
@@ -235,6 +253,42 @@ print(fn(x))  # DS: [1. 1. 1.]  — without DS: [0. 0. 0.]
 
 Both handlers are in `DsTransformPass.cpp::processOps()`, before the AddOp handler. The constant is not erased — its SSA value becomes the `hi` component directly.
 
+### 8. DS exp / log — Working ✅ (ported 2026-10-04, verified on H100 2026-10-08)
+
+`stablehlo.exponential` → `emitDsExp`, `stablehlo.log` → `emitDsLog` in `DsTransformPass.cpp`, ported from `double-single-libm`'s `expds` (`exp.c`) and `logds` (`log.c`). The lookup tables are `stablehlo_pass/libmds/exp_table.h` and `log_table.h`, copied unmodified from that library and `#include`d by the pass.
+
+**Verified on the host (no container needed):** `tests/ds_ref.py`'s `ds_exp` / `ds_log` are a NumPy transcription of the same sequence and match the C library bit-for-bit on 1.19M random double-single inputs (library compiled with gcc, compared through ctypes). The only intended difference is `log(0)`, below.
+
+**Verified on H100 (2026-10-08):** `bash tests/run_tests.sh --bench` passes all 7 suites. `test_ds_exp_log.py`'s GPU results match the NumPy reference bitwise; `exp(a)*exp(-a) - 1` and `log(exp(a)) - a` come out at ~1e-14. Still not run: that file's `DS_RETURN_PAIRS=1` pair-accuracy section, and anything on L40S.
+
+**Black-Scholes on H100 (2026-10-08, f64 inputs, max relative price error vs NumPy f64 / median ms):**
+
+| Batch | f64 ms | DS ms | f32 ms | f64/DS | f64 relerr | DS relerr | f32 relerr |
+|---|---|---|---|---|---|---|---|
+| 1,024 | 0.043 | 0.056 | 0.041 | 0.76× | 2.3e-14 | 3.2e-11 | 1.2e-03 |
+| 65,536 | 0.043 | 0.083 | 0.042 | 0.52× | 4.6e-13 | 1.9e-10 | 7.8e-03 |
+| 1,048,576 | 0.078 | 0.266 | 0.062 | 0.29× | 1.1e-11 | 2.3e-10 | 7.9e-03 |
+| 16,777,216 | 0.349 | 2.406 | 0.209 | 0.14× | 1.2e-11 | 3.6e-10 | 9.8e-03 |
+
+DS is ~10^7× more accurate than native f32 and within ~30× of native f64, but slower than native f64 at every size on this GPU.
+
+**f64 split bug found and fixed on the way (2026-10-08).** XLA folds `convert(convert(v, f32), f64)` back to `v`. The optimization barrier in `emitFromFloat` only covered the `lo` computation; `hi` was widened again, unbarriered, in `emitToFloat` at `func.return`, where the fold turned `f64(hi) + f64(lo)` into `v + f64(lo)` — every f64 result off by `lo` (f32-level). It also hit the small helper modules JAX compiles ahead of a jitted function, which the plugin transforms too, so inputs arrived already shifted by `lo`. Fix: `hi` is now the barrier's output, so every use goes through it; and `func.return` passes an untouched function argument straight through. Before the fix Black-Scholes DS relerr was ~1e-5 and the f64 `sum` test error 4.5e-5; after, ~3e-10 and 2.6e-12. `tests/diag_f64_ops.py` (per-op f64 accuracy) and `tests/diag_f64_split.py` (raw split values + HLO dumps) are the diagnostics that found it.
+
+How the library's C maps to StableHLO:
+- Branches (special cases, log's `zh >= sqrt(2)` step) → `stablehlo.select`; both arms are always computed.
+- `memcpy` float↔int and shifts → `stablehlo.bitcast_convert`, `shift_left`, `shift_right_arithmetic`, `shift_right_logical`, `and` on `i32` tensors.
+- Table reads → `stablehlo.gather` of size-1 slices from a rank-1 constant, with the index-vector dimension implied (`index_vector_dim == rank(indices)`). 2 gathers for exp, 3 for log.
+- FMA-based `__libmds_mul_2_11` → `emitTwoProd` (Veltkamp), same substitution as divide.
+
+Deliberate differences from the library:
+- **`log(0)` returns `(-Inf, 0)`.** The library's comment says "Return -inf" but its code computes `1.0f / (0.0f * 0.0f)` = `+Inf` (confirmed by running it).
+- `k = ssxh - SHIFTER` in exp is replaced by `convert(kint)` (same value, exact), and one `fast_two_sum(c2, q)` by `two_sum`. Reason: `(x + C) - C` is a shape XLA's algebraic simplifier may reassociate to `x + (C - C)`. `emitTwoSum` now also swaps its operands when the first is a constant, for the same reason — this applies to existing ops too (e.g. `1.0 - x`). **This is a precaution based on reading XLA's simplifier rules, not something observed in a dump**; worth confirming against optimized HLO.
+- The log table index is clamped to 181, because special-case inputs still evaluate the main path.
+
+Measured accuracy of the algorithms themselves (NumPy reference, relative error vs f64): exp ≤ 2^-42.9 for results in the normal range, degrading toward f32 level for results below ~1e-30 (the `lo` word goes subnormal); log ≤ 2^-47.5 for arguments ≥ 2, but up to 2^-38.5 for arguments within ~1% of 1.
+
+**Black-Scholes:** `tests/bench_blackscholes.py` is a JAX port of the PARSEC kernel in `blackscholes/blackscholes_torch.py` (checked against `blackscholes/reference_scalar.py`: max abs diff 4e-14). It times native f64, DS-f32, and native f32, and reports price error against NumPy f64. Every float op in the kernel now has a DS handler. `tests/run_tests.sh --bench` runs it.
+
 ### 6. Test Suite — Working ✅
 Confirmed 2026-06-19. Run from inside the container:
 ```bash
@@ -248,15 +302,11 @@ All tests pass in both GPU mode (with PJRT plugin) and CPU-only mode:
 - Section 2 (MLIR structural): op count assertions on lowered MLIR
 - Section 3 (GPU numerical): precision improvement assertions on device
 
-**Benchmark results** (H100, median over 50 reps):
+**Full benchmark results:** see `h100_results.txt` (H100, 2026-06-26) and `l40_results.txt` (L40S, 2026-06-26). Narrative analysis in `python/ds_results_compiler_pass_h100.txt` and `python/ds_results_l40s.txt`.
 
-| fn | Size | f32 (ms) | DS (ms) | Overhead |
-|---|---|---|---|---|
-| `dot(a*a, b)` | 1K | 0.033 | 0.038 | 1.14× |
-| `dot(a*a, b)` | 1M | 0.040 | 0.064 | 1.60× |
-| `(A*A)@B` | 64² | 0.06 | 0.05 | 0.87× |
-| `(A*A)@B` | 2048² | 0.12 | 0.29 | 2.42× |
-| `A@B` | 2048² | 0.11 | 0.29 | 2.67× |
+Key headline numbers (from the results files):
+- DS vs f32 overhead at 2048²: **2.47×** on H100, **3.29×** on L40S (4 sub-matmuls vs 1)
+- f64 vs DS-f32 speedup at 2048² matmul: **1.13×** on H100 (f64 tensor cores parity), **12.87×** on L40S (no f64 tensor cores)
 
 ---
 
@@ -264,7 +314,11 @@ All tests pass in both GPU mode (with PJRT plugin) and CPU-only mode:
 
 | Operation | Status |
 |---|---|
-| Element-wise `add` / `sub` / `mul` inside `jax.jit` | ✅ |
+| Element-wise `add` / `sub` / `mul` / `divide` / `sqrt` inside `jax.jit` | ✅ |
+| `negate`, `abs`, comparisons, `select` / `jnp.where`, `maximum` / `minimum` | ✅ |
+| `exp` / `log` | ✅ (see section 8) |
+| `sqrt(0)`, `x / 0` | ⚠️ NaN (not 0 / ±Inf) — property of the reference library's sequences |
+| Any other float op (`tanh`, `sin`, `power`, `erf`, `reshape`, …) | ❌ Untransformed; DS precision lost from that op on. `DS_WARN_UNSUPPORTED=1` reports them |
 | Arithmetic with scalar constants (`a + 1.0`, `a * 0.5`) | ✅ |
 | `jnp.sum`, `jnp.mean` (single add/sub/mul reduce body) | ✅ |
 | `jnp.matmul` preceded by DS ops, `precision=HIGHEST` | ✅ |
@@ -290,7 +344,8 @@ All tests pass in both GPU mode (with PJRT plugin) and CPU-only mode:
 | PJRT C API header | `/opt/xla-pjrt/xla/pjrt/c/pjrt_c_api.h` |
 | PJRT API version | 0.104 |
 | StableHLO version | 1.16.3 (pinned in Dockerfile) |
-| Inline pass pipeline (GPU) | `vhlo-to-version{target=1.16.3},vhlo-legalize-to-stablehlo,func.func(ds-transform),stablehlo-legalize-to-vhlo` |
+| Inline pass pipeline (GPU) | `vhlo-to-version{target=1.16.3},vhlo-legalize-to-stablehlo,inline,func.func(ds-transform),stablehlo-legalize-to-vhlo` |
+| Plugin temp files | Unique per compile call (`/tmp/ds_in_XXXXXX`, `ds_out_`, `ds_err_`, via `mkstemp`), removed when the call returns; the pass's stderr is forwarded to the plugin's stderr |
 | `libVersion.a` | `/opt/mlir/lib/libVersion.a` — linked in `stablehlo_pass/CMakeLists.txt` |
 
 ---
@@ -303,6 +358,8 @@ All tests pass in both GPU mode (with PJRT plugin) and CPU-only mode:
 | `DS_BYPASS=1` | Skip all transformation; pure passthrough to real backend |
 | `DS_TEST_PASSTHROUGH=1` | Run DS pass but send original bytecode to backend |
 | `DS_PASS_MODE=ffi` | Use FFI pass (`ds-ffi-transform`) instead of inline pass |
+| `DS_RETURN_PAIRS=1` | A value returned exactly twice from a jitted function comes back as its raw `(hi, lo)` pair instead of the recombined result (test diagnostic) |
+| `DS_WARN_UNSUPPORTED=1` | Report every op that consumes a DS-tracked value but is not transformed |
 
 ---
 
@@ -379,18 +436,17 @@ bash tests/run_tests.sh --f64-only
 bash tests/run_tests.sh --bench --f64-only
 ```
 
-### Measured benchmark results (H100 PCIe, 2026-06-23)
+### Measured benchmark results (H100 PCIe, 2026-06-26)
 
-| Operation | f64 (ms) | DS-f32 (ms) | DS/f64 ratio |
-|---|---|---|---|
-| Element-wise n=1M | 0.059 | 0.058 | 0.98× (DS ≈ f64) |
-| Reduction n=1M | 0.041 | 0.043 | 1.05× (DS ≈ f64) |
-| Matmul 256² | 0.04 | 0.06 | 1.39× (DS slower) |
-| Matmul 2048² | 0.36 | 0.32 | 0.89× (DS slightly faster) |
+See `h100_results.txt` for full tables. Summary from that run:
 
-DS-f32 and native f64 are within ~10–15% across all tested sizes. The H100 has native FP64 tensor cores (~51 TFLOPS PCIe), making f64 GEMM competitive with f32. The large speedup expected for GPUs without FP64 hardware does not apply to H100 but would apply to consumer GPUs (RTX series, etc.) where f64 is 1/32–1/64 of f32 speed.
+- Element-wise and reduction: DS-f32 within ~10% of native f64 at 1M elements (1.06× and 0.96× respectively)
+- Matmul 2048²: DS-f32 **1.13× faster** than f64 (f64=0.35ms, DS=0.31ms; H100 f64 tensor cores confirmed at 48.6 TFLOPS)
+- Matmul 256²: DS-f32 0.71× of f64 speed (4 launches vs 1 at latency-dominated size)
 
-**Precision improvement over f32 (confirmed):** DS-f32 sum error 1.49e-05 vs f32 error 1.22e-04 — 8× improvement.
+DS-f32 and native f64 are within ~10–15% at throughput-dominated sizes (≥1024²). The H100 has native FP64 tensor cores (~51 TFLOPS PCIe), making f64 GEMM competitive with f32. The large speedup expected for GPUs without FP64 hardware does not apply to H100 but does apply to the L40S (see `l40_results.txt`, up to 12.87× at 2048²).
+
+**Precision improvement over f32 (confirmed):** DS-f32 sum error 1.49e-05 vs f32 error 1.22e-04 — 8× improvement (from `h100_results.txt`, f64 sum n=10000 test).
 
 ---
 
@@ -398,9 +454,9 @@ DS-f32 and native f64 are within ~10–15% across all tested sizes. The H100 has
 
 These are not assigned — listed in rough priority order for whoever picks this up next.
 
-1. **Run `bench_f64_vs_ds.py` and record the f64 vs DS speedup table** — this is the primary paper result. Fill in the table above with measured numbers.
+1. ~~**Run `bench_f64_vs_ds.py` and record the f64 vs DS speedup table**~~ ✅ **Done (2026-06-26).** H100: `h100_results.txt`. L40S: `l40_results.txt`. Up to 12.87× speedup on 2048² matmul on L40S.
 
-2. **Benchmark DS vs f32 with `precision=HIGHEST` on larger matmul sizes.** The current benchmark uses default precision (TF32). A paper-quality comparison needs both sides at the same precision setting. Run `bench_matmul.py` after modifying the inner benchmark code to use `jnp.dot(..., precision="highest")` in both f32 and DS modes.
+2. **Benchmark DS vs f32 with `precision=HIGHEST` on larger matmul sizes.** The current benchmark uses default precision (TF32). A fair comparison needs both sides at the same precision setting. Run `bench_matmul.py` after modifying the inner benchmark code to use `jnp.dot(..., precision="highest")` in both f32 and DS modes.
 
 2. **Multi-input `stablehlo.reduce`.** The ReduceOp handler in `DsTransformPass.cpp` skips reductions with more than 1 input (`if (redOp.getInputs().size() != 1) continue`). Extending to 2-input reductions (e.g., simultaneous min+max scans) would require 4 block args per input pair.
 
@@ -410,6 +466,6 @@ These are not assigned — listed in rough priority order for whoever picks this
 
 5. **Standalone matmul precision improvement via input splitting.** For `A @ B` with no prior DS ops, lo=0 so there is no benefit. To get improvement here, the pass would need to split each input element via `two_prod(A[i,k], 1.0)` to create a lo channel — but this costs an O(M×K + K×N) element-wise pass and is only worthwhile if the matmul accumulation error is the bottleneck.
 
-6. **Paper benchmarks.** For the paper, run the full benchmark suite with `--bench` on a clean session and record: overhead table, precision improvement table (using `precision=HIGHEST` for matmul), and the catastrophic cancellation stress test results.
+6. **Run the Black-Scholes benchmark on L40S** (`bash tests/run_tests.sh --bench`); H100 numbers are in section 8. Also still open: confirm against optimized HLO whether XLA really reassociates `(x + C) - C` (the reason for `emitTwoSum`'s constant swap).
 
 7. **Bring FFI pass to parity with inline pass.** Currently the FFI pass only handles `add`/`sub`/`mul`. To enable a fair inline vs. FFI comparison: (a) add `stablehlo.constant` and `stablehlo.broadcast_in_dim` handlers to `DsFFIPass.cpp` mirroring what was added to `DsTransformPass.cpp`; (b) write a `ds_reduce` CUDA kernel in `cpp/` for reductions; (c) write a `ds_matmul` wrapper (4 cuBLAS dispatches) in `cpp/`; (d) add ReduceOp and DotGeneralOp handlers in `DsFFIPass.cpp`. Once at parity, benchmark `DS_PASS_MODE=ffi` vs default inline on the existing bench scripts. The FFI path may be more maintainable (CUDA kernels vs. MLIR C++); the benchmark will show whether the fusion loss is acceptable for the target workloads.

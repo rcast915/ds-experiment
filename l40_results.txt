@@ -1,0 +1,221 @@
+DS Compiler Pass — Test Suite
+  Project root : /src/ds_experiment
+  mlir-ds-opt  : found
+  PJRT plugin  : found
+  GPU mode     : YES
+  Benchmarks   : yes
+
+Running: Dot Product Accuracy (f32)
+============================================================
+  Dot Product — DS Compiler Pass Accuracy Tests
+============================================================
+
+[Section 1: NumPy Reference]
+
+  PASS  basic correctness: dot([1,2,3],[4,5,6]) == 32.0
+  PASS  catastrophic cancellation: DS recovers tiny value
+  PASS  NaN propagation: dot with NaN element → NaN
+  PASS  Inf propagation: dot with Inf element → Inf or NaN
+  PASS  subnormal inputs: result is finite
+  PASS  subnormal inputs: DS error ≤ f32 error
+  PASS  mixed subnormal/normal: result is finite
+  PASS  zero vector: dot(0, b) == 0
+  PASS  self-dot (sum of squares): DS error ≤ f32 error
+  PASS  ill-conditioned sum: DS error ≤ f32 error
+
+[Section 2: MLIR Structural]
+
+  PASS  pass exits cleanly (returncode 0)
+  PASS  dot_general expands to 4 sub-matmuls (got 4)
+  PASS  multiply ops present for Veltkamp split (got 10)
+  PASS  subtract ops present for two_sum (got 15)
+  PASS  plain dot_general also expands to 4 sub-matmuls (got 4)
+  PASS  jnp.sum expands to 1 DS reduce op (got 1)
+
+[Section 3: GPU Numerical]
+
+  PASS  cancellation (x+y)-x: DS recovers at least one component
+  PASS  sq_dot n=10000: DS error (4.649e-06) ≤ f32 error (7.927e-05)
+  PASS  triplet sum n=3333: DS error (0.000e+00) < f32 error (3.333e+03)
+  PASS  NaN propagation through plugin: result is NaN
+  PASS  Inf propagation through plugin: result is Inf or NaN
+
+All dot product tests passed.
+  ✓  Dot Product Accuracy (f32) — PASSED
+
+Running: Matrix Multiply Accuracy (f32)
+============================================================
+  Matrix Multiply — DS Compiler Pass Accuracy Tests
+============================================================
+
+[Section 1: NumPy Reference]
+
+  PASS  basic correctness: DS error ≤ f32 error on random 4×8 @ 8×4
+  PASS  identity: DS(A @ I) matches f64 exactly
+  PASS  cancellation pattern: DS error ≤ f32 error
+  PASS  NaN propagation: NaN in A row → that output row is NaN
+  PASS  Inf propagation: Inf in A → corresponding output is Inf or NaN
+  PASS  subnormal inputs: result is finite
+  PASS  ill-conditioned 1×n @ n×1: DS error ≤ f32 error
+
+[Section 2: MLIR Structural]
+
+  PASS  pass exits cleanly (returncode 0)
+  PASS  (A*A)@B: dot_general expands to 4 sub-matmuls (got 4)
+  PASS  (A*A)@B: multiply ops for Veltkamp split (got 10)
+  PASS  (A*A)@B: add ops for two_sum (got 13)
+  PASS  plain A@B: also expands to 4 sub-matmuls (got 4)
+  PASS  (A@B)+C: dot_general expands and add chains (dots=4, subs=16)
+
+[Section 3: GPU Numerical]
+
+  PASS  (A*A)@ones n=10000: DS error (4.649e-06) ≤ f32 error (7.927e-05)
+  PASS  standalone A@B: DS result is numerically valid (finite, non-zero)
+         (note) standalone matmul: ds_err=0.000e+00, f32_err=0.000e+00 — no improvement expected (lo=0)
+  PASS  NaN propagation through matmul plugin: row 0 contains NaN
+  PASS  (A*A)@B 256×256 HIGHEST precision: DS error (3.119e-06) ≤ f32 (4.675e-06)
+
+All matmul tests passed.
+  ✓  Matrix Multiply Accuracy (f32) — PASSED
+
+Running: Float64 → DS Accuracy
+============================================================
+  Float64 → DS Compiler Pass Accuracy Tests
+============================================================
+
+[Section 1: NumPy Reference — f64 split]
+
+  PASS  f64 split: hi + lo reconstructs x  (rel err < 2^-46)
+  PASS  DS add of f64-split values ≈ native f64 add  (rel err < 2^-46)
+  PASS  DS sum n=1000: DS error (7.276e-12) ≤ f32 error (0.000e+00)
+  PASS  cancellation (x+y)-x, x=1e8, y=1e-2: DS recovers y (err < 1e-3)
+  PASS  cancellation: DS much better than naive f32
+
+[Section 2: MLIR Structural — f64 inputs]
+
+  PASS  input MLIR has f64 ops  (JAX_ENABLE_X64 active)
+  PASS  f64 add: pass exits cleanly
+  PASS  f64 add → DS: stablehlo.convert present (got 8, expected ≥ 4)
+  PASS  f64 add → DS: subtract ops for two_sum (got 14, expected ≥ 4)
+  PASS  f64 sum: pass exits cleanly
+  PASS  f64 sum → 1 DS reduce op (got 1)
+  PASS  f64 matmul: pass exits cleanly
+  PASS  f64 matmul → 4 DS sub-matmuls (got 4)
+  PASS  f64 matmul → DS: convert ops present (got 8, expected ≥ 4)
+
+[Section 3: GPU Numerical — f64 inputs via DS plugin]
+
+  PASS  f64 cancellation: DS-f32 recovers y  (max rel err < 0.01)
+  PASS  f64 cancellation: DS better than naive f32
+  PASS  f64 sum n=10000: DS error (1.490e-05) ≤ f32 error (1.221e-04)
+  PASS  NaN propagation through plugin (f64 input): result is NaN
+
+All f64 DS tests passed.
+  ✓  Float64 → DS Accuracy — PASSED
+
+Benchmark: Dot Product Performance (f32)
+========================================================================
+  Dot Product — Performance Benchmark
+  fn: jnp.dot(a * a, b)  [mul creates DS lo channels]
+  warmup=10, reps=50, median reported
+  mode: GPU (PJRT plugin)
+========================================================================
+
+      Size    f32 (ms)     DS (ms)    overhead    f32 GFLOPS     DS GFLOPS
+------------------------------------------------------------------------
+     1,000       0.051       0.059        1.14×          0.04          0.03
+    10,000       0.052       0.066        1.26×          0.38          0.30
+   100,000       0.057       0.052        0.92×          3.54          3.86
+ 1,000,000       0.055       0.053        0.96×         36.07         37.41
+
+  Overhead summary: min 0.92× | mean 1.07× | max 1.26×
+  (overhead > 1 means DS is slower than f32)
+
+Note: FLOPs denominator is 2N (standard dot). DS internally executes
+      ~20× more f32 ops for the Veltkamp split + two_prod/two_sum;
+      the overhead column shows the true wall-time cost of DS.
+
+Benchmark: Matrix Multiply Performance (f32)
+========================================================================
+  Matrix Multiply — Performance Benchmark
+  warmup=5, reps=30, median reported
+  mode: GPU (PJRT plugin)
+========================================================================
+
+  fn: (A * A) @ B  [mul creates DS lo channels]
+      Size    f32 (ms)     DS (ms)    overhead    f32 TFLOPS     DS TFLOPS
+  --------------------------------------------------------------------
+        64        0.06        0.06        1.10×         0.009         0.008
+       256        0.06        0.06        1.08×         0.569         0.527
+       512        0.06        0.09        1.51×         4.687         3.111
+     1,024        0.09        0.15        1.66×        24.127        14.573
+     2,048        0.22        0.73        3.29×        77.816        23.645
+
+  [(A*A)@B] overhead: min 1.08× | mean 1.73× | max 3.29×
+
+  fn: A @ B  [standalone, lo=0, DS overhead only]
+      Size    f32 (ms)     DS (ms)    overhead    f32 TFLOPS     DS TFLOPS
+  --------------------------------------------------------------------
+        64        0.05        0.06        1.26×         0.010         0.008
+       256        0.05        0.07        1.23×         0.635         0.516
+       512        0.05        0.08        1.57×         5.024         3.208
+     1,024        0.09        0.14        1.62×        24.161        14.921
+     2,048        0.21        0.70        3.32×        81.522        24.555
+
+  [A@B] overhead: min 1.23× | mean 1.80× | max 3.32×
+
+Notes:
+  TFLOPS denominator = 2·N³ (standard matmul). DS runs 4 sub-matmuls
+  internally, so true DS FLOPs ≈ 4× the standard count.
+  Overhead > 1 in the (A*A)@B case reflects the precision/cost tradeoff.
+  Overhead in the A@B case is the worst-case raw decomposition cost.
+
+Benchmark: Float64 vs DS-f32 Performance
+========================================================================
+  Float64 vs DS-f32 — Performance Benchmark
+  Baseline: native f64 (DS_BYPASS=1)  |  DS: plugin active
+  warmup=5, reps=30, median reported
+  mode: GPU (PJRT plugin)
+========================================================================
+
+  fn: A * A + B  (element-wise)
+          Size    f64 (ms)     DS (ms)    speedup    f64 GFLOPS     DS GFLOPS
+  ------------------------------------------------------------------------
+         1,000       0.051       0.052      0.98×         0.058         0.057
+       100,000       0.052       0.052      1.01×         5.744         5.789
+     1,000,000       0.053       0.076      0.69×        56.957        39.265
+
+  [element-wise] speedup: min 0.69× | mean 0.89× | max 1.01×
+
+  fn: jnp.sum(A)  (reduction)
+          Size    f64 (ms)     DS (ms)    speedup    f64 GFLOPS     DS GFLOPS
+  ------------------------------------------------------------------------
+         1,000       0.050       0.056      0.89×         0.020         0.018
+       100,000       0.055       0.060      0.92×         1.810         1.663
+     1,000,000       0.056       0.061      0.92×        17.752        16.397
+
+  [reduction] speedup: min 0.89× | mean 0.91× | max 0.92×
+
+  fn: A @ B  (f64 vs DS-f32 — main speedup result)
+      Size    f64 (ms)     DS (ms)    speedup    f64 TFLOPS     DS TFLOPS
+  --------------------------------------------------------------------
+       256        0.09        0.07      1.21×         0.379         0.459
+       512        0.28        0.08      3.25×         0.974         3.168
+     1,024        1.65        0.16     10.17×         1.298        13.209
+     2,048       12.19        0.95     12.87×         1.409        18.135
+
+  [matmul] speedup: min 1.21× | mean 6.88× | max 12.87×
+
+Notes:
+  speedup > 1 means DS-f32 is faster than native f64.
+  Matmul: H100 f64 GEMM has no tensor-core support (~30× slower
+    than f32). DS uses 4 f32 GEMMs, so expected speedup ≈ 7–8×.
+  TFLOPS denominator = 2·N³ (standard matmul). DS runs 4 sub-
+    matmuls, so true DS FLOPs ≈ 4× the standard count.
+
+Summary
+  Passed : 3
+  Failed : 0
+  ✓  All test suites passed.
+=== [4/4] Done ===
+[rcastane@bridges2-login014 output

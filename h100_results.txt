@@ -1,0 +1,324 @@
+
+[1mDS Compiler Pass — Test Suite[0m
+  Project root : /src/ds_experiment
+  mlir-ds-opt  : found
+  PJRT plugin  : found
+  GPU mode     : YES
+  Benchmarks   : yes
+
+[1mRunning: Dot Product Accuracy (f32)[0m
+Jax plugin configuration error: Plugin module jax_plugins.xla_cuda12 does not exist
+Jax plugin configuration error: Exception when calling jax_plugins.xla_cuda12_disabled.initialize()
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/xla_bridge.py", line 495, in discover_pjrt_plugins
+    plugin_module.initialize()
+  File "/usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12_disabled/__init__.py", line 370, in initialize
+    _check_cuda_versions(raise_on_first_error = True)
+  File "/usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12_disabled/__init__.py", line 150, in _check_cuda_versions
+    assert cuda_versions is not None
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+[ds_pjrt] Proxy initialized
+E0626 17:05:42.341152    1172 numa_hwloc.cc:121] Call to hwloc_set_cpubind() failed: Invalid argument [22]
+E0626 17:05:42.341269    1173 numa_hwloc.cc:121] Call to hwloc_set_cpubind() failed: Invalid argument [22]
+E0626 17:05:42.341310    1174 numa_hwloc.cc:121] Call to hwloc_set_cpubind() failed: Invalid argument [22]
+[ds_pjrt] transformed 338 -> 418 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 606 -> 1022 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 322 -> 402 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 538 -> 626 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 337 -> 417 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 671 -> 1117 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 325 -> 405 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 653 -> 861 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 607 -> 807 bytes
+[ds_pjrt] Dispatching with pinned memory...
+============================================================
+  Dot Product — DS Compiler Pass Accuracy Tests
+============================================================
+
+[Section 1: NumPy Reference]
+
+  PASS  basic correctness: dot([1,2,3],[4,5,6]) == 32.0
+  PASS  catastrophic cancellation: DS recovers tiny value
+  PASS  NaN propagation: dot with NaN element → NaN
+  PASS  Inf propagation: dot with Inf element → Inf or NaN
+  PASS  subnormal inputs: result is finite
+  PASS  subnormal inputs: DS error ≤ f32 error
+  PASS  mixed subnormal/normal: result is finite
+  PASS  zero vector: dot(0, b) == 0
+  PASS  self-dot (sum of squares): DS error ≤ f32 error
+  PASS  ill-conditioned sum: DS error ≤ f32 error
+
+[Section 2: MLIR Structural]
+
+  PASS  pass exits cleanly (returncode 0)
+  PASS  dot_general expands to 4 sub-matmuls (got 4)
+  PASS  multiply ops present for Veltkamp split (got 10)
+  PASS  subtract ops present for two_sum (got 15)
+  PASS  plain dot_general also expands to 4 sub-matmuls (got 4)
+  PASS  jnp.sum expands to 1 DS reduce op (got 1)
+
+[Section 3: GPU Numerical]
+
+  PASS  cancellation (x+y)-x: DS recovers at least one component
+  PASS  sq_dot n=10000: DS error (4.649e-06) ≤ f32 error (7.164e-05)
+  PASS  triplet sum n=3333: DS error (0.000e+00) < f32 error (3.333e+03)
+  PASS  NaN propagation through plugin: result is NaN
+  PASS  Inf propagation through plugin: result is Inf or NaN
+
+All dot product tests passed.
+  [32m✓[0m  Dot Product Accuracy (f32) — PASSED
+
+[1mRunning: Matrix Multiply Accuracy (f32)[0m
+Jax plugin configuration error: Plugin module jax_plugins.xla_cuda12 does not exist
+Jax plugin configuration error: Exception when calling jax_plugins.xla_cuda12_disabled.initialize()
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/xla_bridge.py", line 495, in discover_pjrt_plugins
+    plugin_module.initialize()
+  File "/usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12_disabled/__init__.py", line 370, in initialize
+    _check_cuda_versions(raise_on_first_error = True)
+  File "/usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12_disabled/__init__.py", line 150, in _check_cuda_versions
+    assert cuda_versions is not None
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+[ds_pjrt] Proxy initialized
+E0626 17:05:45.060216    1232 numa_hwloc.cc:121] Call to hwloc_set_cpubind() failed: Invalid argument [22]
+E0626 17:05:45.060347    1233 numa_hwloc.cc:121] Call to hwloc_set_cpubind() failed: Invalid argument [22]
+E0626 17:05:45.060387    1234 numa_hwloc.cc:121] Call to hwloc_set_cpubind() failed: Invalid argument [22]
+[ds_pjrt] transformed 322 -> 402 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 534 -> 622 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 337 -> 417 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 534 -> 622 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 704 -> 1160 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 482 -> 518 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 532 -> 620 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 617 -> 817 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 339 -> 419 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 532 -> 620 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 599 -> 799 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 326 -> 406 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 675 -> 1121 bytes
+[ds_pjrt] Dispatching with pinned memory...
+============================================================
+  Matrix Multiply — DS Compiler Pass Accuracy Tests
+============================================================
+
+[Section 1: NumPy Reference]
+
+  PASS  basic correctness: DS error ≤ f32 error on random 4×8 @ 8×4
+  PASS  identity: DS(A @ I) matches f64 exactly
+  PASS  cancellation pattern: DS error ≤ f32 error
+  PASS  NaN propagation: NaN in A row → that output row is NaN
+  PASS  Inf propagation: Inf in A → corresponding output is Inf or NaN
+  PASS  subnormal inputs: result is finite
+  PASS  ill-conditioned 1×n @ n×1: DS error ≤ f32 error
+
+[Section 2: MLIR Structural]
+
+  PASS  pass exits cleanly (returncode 0)
+  PASS  (A*A)@B: dot_general expands to 4 sub-matmuls (got 4)
+  PASS  (A*A)@B: multiply ops for Veltkamp split (got 10)
+  PASS  (A*A)@B: add ops for two_sum (got 13)
+  PASS  plain A@B: also expands to 4 sub-matmuls (got 4)
+  PASS  (A@B)+C: dot_general expands and add chains (dots=4, subs=16)
+
+[Section 3: GPU Numerical]
+
+  PASS  (A*A)@ones n=10000: DS error (4.649e-06) ≤ f32 error (7.164e-05)
+  PASS  standalone A@B: DS result is numerically valid (finite, non-zero)
+         (note) standalone matmul: ds_err=0.000e+00, f32_err=0.000e+00 — no improvement expected (lo=0)
+  PASS  NaN propagation through matmul plugin: row 0 contains NaN
+  PASS  (A*A)@B 256×256 HIGHEST precision: DS error (3.131e-06) ≤ f32 (5.484e-06)
+
+All matmul tests passed.
+  [32m✓[0m  Matrix Multiply Accuracy (f32) — PASSED
+
+[1mRunning: Float64 → DS Accuracy[0m
+Jax plugin configuration error: Exception when calling jax_plugins.xla_cuda12_disabled.initialize()
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/jax/_src/xla_bridge.py", line 495, in discover_pjrt_plugins
+    plugin_module.initialize()
+  File "/usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12_disabled/__init__.py", line 370, in initialize
+    _check_cuda_versions(raise_on_first_error = True)
+  File "/usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12_disabled/__init__.py", line 150, in _check_cuda_versions
+    assert cuda_versions is not None
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+Jax plugin configuration error: Plugin module jax_plugins.xla_cuda12 does not exist
+[ds_pjrt] Proxy initialized
+E0626 17:05:54.339823    1343 numa_hwloc.cc:121] Call to hwloc_set_cpubind() failed: Invalid argument [22]
+E0626 17:05:54.340198    1344 numa_hwloc.cc:121] Call to hwloc_set_cpubind() failed: Invalid argument [22]
+E0626 17:05:54.340392    1345 numa_hwloc.cc:121] Call to hwloc_set_cpubind() failed: Invalid argument [22]
+[ds_pjrt] transformed 323 -> 417 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 601 -> 1034 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 322 -> 415 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 533 -> 641 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 658 -> 932 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 338 -> 432 bytes
+[ds_pjrt] Dispatching with pinned memory...
+[ds_pjrt] transformed 602 -> 823 bytes
+[ds_pjrt] Dispatching with pinned memory...
+============================================================
+  Float64 → DS Compiler Pass Accuracy Tests
+============================================================
+
+[Section 1: NumPy Reference — f64 split]
+
+  PASS  f64 split: hi + lo reconstructs x  (rel err < 2^-46)
+  PASS  DS add of f64-split values ≈ native f64 add  (rel err < 2^-46)
+  PASS  DS sum n=1000: DS error (7.276e-12) ≤ f32 error (0.000e+00)
+  PASS  cancellation (x+y)-x, x=1e8, y=1e-2: DS recovers y (err < 1e-3)
+  PASS  cancellation: DS much better than naive f32
+
+[Section 2: MLIR Structural — f64 inputs]
+
+  PASS  input MLIR has f64 ops  (JAX_ENABLE_X64 active)
+  PASS  f64 add: pass exits cleanly
+  PASS  f64 add → DS: stablehlo.convert present (got 8, expected ≥ 4)
+  PASS  f64 add → DS: subtract ops for two_sum (got 14, expected ≥ 4)
+  PASS  f64 sum: pass exits cleanly
+  PASS  f64 sum → 1 DS reduce op (got 1)
+  PASS  f64 matmul: pass exits cleanly
+  PASS  f64 matmul → 4 DS sub-matmuls (got 4)
+  PASS  f64 matmul → DS: convert ops present (got 8, expected ≥ 4)
+
+[Section 3: GPU Numerical — f64 inputs via DS plugin]
+
+  PASS  f64 cancellation: DS-f32 recovers y  (max rel err < 0.01)
+  PASS  f64 cancellation: DS better than naive f32
+  PASS  f64 sum n=10000: DS error (1.490e-05) ≤ f32 error (1.221e-04)
+  PASS  NaN propagation through plugin (f64 input): result is NaN
+
+All f64 DS tests passed.
+  [32m✓[0m  Float64 → DS Accuracy — PASSED
+
+[1mBenchmark: Dot Product Performance (f32)[0m
+========================================================================
+  Dot Product — Performance Benchmark
+  fn: jnp.dot(a * a, b)  [mul creates DS lo channels]
+  warmup=10, reps=50, median reported
+  mode: GPU (PJRT plugin)
+========================================================================
+
+      Size    f32 (ms)     DS (ms)    overhead    f32 GFLOPS     DS GFLOPS
+------------------------------------------------------------------------
+     1,000       0.034       0.037        1.11×          0.06          0.05
+    10,000       0.034       0.053        1.58×          0.59          0.38
+   100,000       0.036       0.038        1.06×          5.60          5.31
+ 1,000,000       0.037       0.053        1.42×         53.89         37.85
+
+  Overhead summary: min 1.06× | mean 1.29× | max 1.58×
+  (overhead > 1 means DS is slower than f32)
+
+Note: FLOPs denominator is 2N (standard dot). DS internally executes
+      ~20× more f32 ops for the Veltkamp split + two_prod/two_sum;
+      the overhead column shows the true wall-time cost of DS.
+
+[1mBenchmark: Matrix Multiply Performance (f32)[0m
+========================================================================
+  Matrix Multiply — Performance Benchmark
+  warmup=5, reps=30, median reported
+  mode: GPU (PJRT plugin)
+========================================================================
+
+  fn: (A * A) @ B  [mul creates DS lo channels]
+      Size    f32 (ms)     DS (ms)    overhead    f32 TFLOPS     DS TFLOPS
+  --------------------------------------------------------------------
+        64        0.04        0.04        1.20×         0.014         0.012
+       256        0.05        0.04        0.91×         0.713         0.783
+       512        0.06        0.07        1.21×         4.339         3.596
+     1,024        0.08        0.10        1.24×        26.502        21.320
+     2,048        0.12        0.29        2.47×       147.562        59.635
+
+  [(A*A)@B] overhead: min 0.91× | mean 1.41× | max 2.47×
+
+  fn: A @ B  [standalone, lo=0, DS overhead only]
+      Size    f32 (ms)     DS (ms)    overhead    f32 TFLOPS     DS TFLOPS
+  --------------------------------------------------------------------
+        64        0.04        0.05        1.35×         0.015         0.011
+       256        0.04        0.04        1.00×         0.802         0.802
+       512        0.06        0.07        1.26×         4.565         3.623
+     1,024        0.07        0.11        1.51×        29.513        19.571
+     2,048        0.11        0.28        2.55×       153.759        60.396
+
+  [A@B] overhead: min 1.00× | mean 1.53× | max 2.55×
+
+Notes:
+  TFLOPS denominator = 2·N³ (standard matmul). DS runs 4 sub-matmuls
+  internally, so true DS FLOPs ≈ 4× the standard count.
+  Overhead > 1 in the (A*A)@B case reflects the precision/cost tradeoff.
+  Overhead in the A@B case is the worst-case raw decomposition cost.
+
+[1mBenchmark: Float64 vs DS-f32 Performance[0m
+========================================================================
+  Float64 vs DS-f32 — Performance Benchmark
+  Baseline: native f64 (DS_BYPASS=1)  |  DS: plugin active
+  warmup=5, reps=30, median reported
+  mode: GPU (PJRT plugin)
+========================================================================
+
+  fn: A * A + B  (element-wise)
+          Size    f64 (ms)     DS (ms)    speedup    f64 GFLOPS     DS GFLOPS
+  ------------------------------------------------------------------------
+         1,000       0.046       0.034      1.35×         0.065         0.087
+       100,000       0.036       0.037      0.98×         8.416         8.215
+     1,000,000       0.060       0.057      1.06×        50.002        52.938
+
+  [element-wise] speedup: min 0.98× | mean 1.13× | max 1.35×
+
+  fn: jnp.sum(A)  (reduction)
+          Size    f64 (ms)     DS (ms)    speedup    f64 GFLOPS     DS GFLOPS
+  ------------------------------------------------------------------------
+         1,000       0.033       0.035      0.94×         0.030         0.028
+       100,000       0.037       0.042      0.89×         2.701         2.407
+     1,000,000       0.038       0.040      0.96×        26.260        25.237
+
+  [reduction] speedup: min 0.89× | mean 0.93× | max 0.96×
+
+  fn: A @ B  (f64 vs DS-f32 — main speedup result)
+      Size    f64 (ms)     DS (ms)    speedup    f64 TFLOPS     DS TFLOPS
+  --------------------------------------------------------------------
+       256        0.04        0.05      0.71×         0.886         0.628
+       512        0.07        0.08      0.84×         4.008         3.354
+     1,024        0.10        0.11      0.92×        22.078        20.280
+     2,048        0.35        0.31      1.13×        48.555        54.645
+
+  [matmul] speedup: min 0.71× | mean 0.90× | max 1.13×
+
+Notes:
+  speedup > 1 means DS-f32 is faster than native f64.
+  Matmul: on GPUs without native FP64 tensor cores (e.g. L40S),
+    f64 GEMM runs at ~1/64 f32 throughput. DS uses 4 f32 GEMMs,
+    so expected speedup ≈ 7–16× over native f64.
+  TFLOPS denominator = 2·N³ (standard matmul). DS runs 4 sub-
+    matmuls, so true DS FLOPs ≈ 4× the standard count.
+
+[1mSummary[0m
+  Passed : 3
+  Failed : 0
+  [32m✓[0m  All test suites passed.

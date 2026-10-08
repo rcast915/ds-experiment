@@ -271,8 +271,12 @@ def run_gpu_tests():
     def cancel_fn(x, y):
         return (x + y) - x
 
+    # Each pair must fit in DS's ~48 significant bits. 1e12 is not exactly
+    # representable in f32 (it splits to hi=999999995904, lo=4096), and the
+    # ulp of that lo word is 2^-11 ~ 4.9e-4, so a y far below that cannot
+    # survive even in exact DS arithmetic; y = 1.0 can.
     x_np = np.array([1e8,  1e10, 1e12], dtype=np.float64)
-    y_np = np.array([1e-2, 1e-3, 1e-4], dtype=np.float64)
+    y_np = np.array([1e-2, 1e-3, 1.0], dtype=np.float64)
     x    = jnp.array(x_np)
     y    = jnp.array(y_np)
 

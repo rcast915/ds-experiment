@@ -141,6 +141,7 @@ if [[ "$F64_ONLY" -eq 0 ]]; then
     run_test "Trivial/Comparison Ops (negate/abs/compare/select/max/min)" "test_ds_trivial_ops.py"
     run_test "Divide Accuracy (f32)" "test_ds_divide.py"
     run_test "Sqrt Accuracy (f32)" "test_ds_sqrt.py"
+    run_test "Exp/Log Accuracy (f32)" "test_ds_exp_log.py"
 fi
 
 # f64 test needs JAX_ENABLE_X64=1 in the environment.
@@ -179,6 +180,12 @@ if [[ "$RUN_BENCH" -eq 1 ]]; then
         eval "env $PJRT_ENV JAX_ENABLE_X64=1 python3 $SCRIPT_DIR/bench_f64_vs_ds.py" || true
     else
         eval "env JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 python3 $SCRIPT_DIR/bench_f64_vs_ds.py" || true
+    fi
+    banner "Benchmark: Black-Scholes, Float64 vs DS-f32"
+    if [[ "$USE_PLUGIN" -eq 1 ]]; then
+        eval "env $PJRT_ENV JAX_ENABLE_X64=1 python3 $SCRIPT_DIR/bench_blackscholes.py" || true
+    else
+        warn "Black-Scholes benchmark needs the PJRT plugin — skipped"
     fi
 fi
 
