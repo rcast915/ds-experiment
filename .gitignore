@@ -8,3 +8,7 @@
 # Logs
 logs/output/
 logs/error/
+
+# Container image and sandbox kept in the repo dir on orthus
+*.sif
+ds-sandbox/

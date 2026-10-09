@@ -272,6 +272,17 @@ Both handlers are in `DsTransformPass.cpp::processOps()`, before the AddOp handl
 
 DS is ~10^7× more accurate than native f32 and within ~30× of native f64, but slower than native f64 at every size on this GPU.
 
+**Black-Scholes on L40S (Bridges-2, 2026-10-08, commit 82b3cf4, same columns):**
+
+| Batch | f64 ms | DS ms | f32 ms | f64/DS | f64 relerr | DS relerr | f32 relerr |
+|---|---|---|---|---|---|---|---|
+| 1,024 | 0.400 | 0.358 | 0.400 | 1.12× | 2.3e-14 | 3.2e-11 | 1.2e-03 |
+| 65,536 | 0.405 | 0.409 | 0.426 | 0.99× | 4.8e-13 | 1.9e-10 | 7.8e-03 |
+| 1,048,576 | 0.750 | 0.702 | 0.376 | 1.07× | 1.1e-11 | 2.3e-10 | 7.9e-03 |
+| 16,777,216 | 5.234 | 6.709 | 1.049 | 0.78× | 1.2e-11 | 3.6e-10 | 9.8e-03 |
+
+DS errors are identical to H100's. No speedup over native f64 on L40S either: parity up to 1M elements, 0.78× at 16M. This run had a ~0.35-0.4 ms floor on every call (the 2026-06-26 L40S run had ~0.05 ms), so rows at or near that floor measure dispatch overhead, not arithmetic; only the 16M row is clearly above it. Same run, f64-vs-DS matmul: 1.43× / 1.62× / 4.46× / 9.55× at 256 / 512 / 1024 / 2048 (default precision; 12.87× in June, with DS at 1.33 ms now vs 0.95 ms then). All 7 suites, the three `DS_RETURN_PAIRS=1` pair-accuracy runs (exp 1.2e-14, log 5.2e-15) and `diag_f64_ops.py` (every op ~1e-14; cancellation cases ~1e-11) passed.
+
 **f64 split bug found and fixed on the way (2026-10-08).** XLA folds `convert(convert(v, f32), f64)` back to `v`. The optimization barrier in `emitFromFloat` only covered the `lo` computation; `hi` was widened again, unbarriered, in `emitToFloat` at `func.return`, where the fold turned `f64(hi) + f64(lo)` into `v + f64(lo)` — every f64 result off by `lo` (f32-level). It also hit the small helper modules JAX compiles ahead of a jitted function, which the plugin transforms too, so inputs arrived already shifted by `lo`. Fix: `hi` is now the barrier's output, so every use goes through it; and `func.return` passes an untouched function argument straight through. Before the fix Black-Scholes DS relerr was ~1e-5 and the f64 `sum` test error 4.5e-5; after, ~3e-10 and 2.6e-12. `tests/diag_f64_ops.py` (per-op f64 accuracy) and `tests/diag_f64_split.py` (raw split values + HLO dumps) are the diagnostics that found it.
 
 How the library's C maps to StableHLO:
@@ -466,6 +477,6 @@ These are not assigned — listed in rough priority order for whoever picks this
 
 5. **Standalone matmul precision improvement via input splitting.** For `A @ B` with no prior DS ops, lo=0 so there is no benefit. To get improvement here, the pass would need to split each input element via `two_prod(A[i,k], 1.0)` to create a lo channel — but this costs an O(M×K + K×N) element-wise pass and is only worthwhile if the matmul accumulation error is the bottleneck.
 
-6. **Run the Black-Scholes benchmark on L40S** (`bash tests/run_tests.sh --bench`); H100 numbers are in section 8. Also still open: confirm against optimized HLO whether XLA really reassociates `(x + C) - C` (the reason for `emitTwoSum`'s constant swap).
+6. **Re-run the L40S benchmarks on a quiet node** — the 2026-10-08 run had a ~0.4 ms per-call floor that hides everything but the largest sizes (section 8). Also still open: confirm against optimized HLO whether XLA really reassociates `(x + C) - C` (the reason for `emitTwoSum`'s constant swap).
 
 7. **Bring FFI pass to parity with inline pass.** Currently the FFI pass only handles `add`/`sub`/`mul`. To enable a fair inline vs. FFI comparison: (a) add `stablehlo.constant` and `stablehlo.broadcast_in_dim` handlers to `DsFFIPass.cpp` mirroring what was added to `DsTransformPass.cpp`; (b) write a `ds_reduce` CUDA kernel in `cpp/` for reductions; (c) write a `ds_matmul` wrapper (4 cuBLAS dispatches) in `cpp/`; (d) add ReduceOp and DotGeneralOp handlers in `DsFFIPass.cpp`. Once at parity, benchmark `DS_PASS_MODE=ffi` vs default inline on the existing bench scripts. The FFI path may be more maintainable (CUDA kernels vs. MLIR C++); the benchmark will show whether the fusion loss is acceptable for the target workloads.

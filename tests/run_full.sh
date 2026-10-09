@@ -13,6 +13,7 @@
 #                                        including Black-Scholes)
 #   4. pair-accuracy sections           (DS_RETURN_PAIRS=1: divide, sqrt, exp/log)
 #   5. tests/diag_f64_ops.py            (per-op accuracy on f64 inputs)
+#   6. tests/diag_f64_matmul.py         (DS matmul accuracy and time vs f64 / f32)
 #
 # Everything is also written to results/<gpu>_<label>.txt. A failing step does
 # not stop the later ones; the exit code is non-zero if any step failed.
@@ -93,6 +94,9 @@ main() {
 
     step "per-op f64 accuracy: diag_f64_ops.py" \
         env "$PJRT" python3 tests/diag_f64_ops.py
+
+    step "matmul accuracy and cost: diag_f64_matmul.py" \
+        env "$PJRT" python3 tests/diag_f64_matmul.py
 
     echo
     echo "################################################################################"
