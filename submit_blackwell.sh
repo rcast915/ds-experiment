@@ -29,6 +29,9 @@
 # the repo directory and are reused if present. Delete both to force a fresh
 # pull, e.g. after the Docker image has been rebuilt.
 #
+# To run a different job script (e.g. only the FMA upper-bound benchmark):
+#   sbatch --export=ALL,DS_JOB_SCRIPT=tests/run_fma_bound.sh submit_blackwell.sh
+#
 # The job runs whatever is checked out — it does not pull.
 
 set -uo pipefail
@@ -66,7 +69,7 @@ singularity exec --nv --writable \
   --bind "$(pwd)":/src/ds_experiment \
   "$SANDBOX" bash -c "
     cd /src/ds_experiment
-    bash tests/run_full.sh '${SLURM_JOB_ID:-manual}'
+    bash ${DS_JOB_SCRIPT:-tests/run_full.sh} '${SLURM_JOB_ID:-manual}'
   "
 rc=$?
 

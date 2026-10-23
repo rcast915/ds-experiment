@@ -300,6 +300,20 @@ Measured accuracy of the algorithms themselves (NumPy reference, relative error 
 
 **Black-Scholes:** `tests/bench_blackscholes.py` is a JAX port of the PARSEC kernel in `blackscholes/blackscholes_torch.py` (checked against `blackscholes/reference_scalar.py`: max abs diff 4e-14). It times native f64, DS-f32, and native f32, and reports price error against NumPy f64. Every float op in the kernel now has a DS handler. `tests/run_tests.sh --bench` runs it.
 
+### 9. DS matmul is only f32-accurate — measured 2026-10-09 (H100)
+
+`tests/diag_f64_matmul.py`, `A @ B` on random normal n×n **f64** inputs, relative Frobenius error vs NumPy f64 / median ms:
+
+| n | f64 | DS (default) | DS (HIGHEST) | f32 (default) | f32 (HIGHEST) |
+|---|---|---|---|---|---|
+| 256 | 5.6e-16 / 0.044 | 2.9e-04 / 0.065 | 1.5e-07 / 0.073 | 2.9e-04 / 0.046 | 1.5e-07 / 0.047 |
+| 1024 | 1.1e-15 / 0.101 | 2.9e-04 / 0.113 | 5.7e-07 / 0.275 | 2.9e-04 / 0.077 | 5.7e-07 / 0.118 |
+| 2048 | 1.6e-15 / 0.353 | 2.9e-04 / 0.357 | 8.1e-07 / 1.536 | 2.9e-04 / 0.116 | 8.1e-07 / 0.410 |
+
+DS error equals plain f32's to two digits at both precision settings. The four f32 GEMMs round every product and partial sum to f32 and nothing captures that rounding; the hi/lo cross terms only carry the inputs' lo words. At default precision the H100 runs those GEMMs on TF32 tensor cores, so an f64 matmul routed through DS comes back with ~3e-4 relative error.
+
+Consequences: (1) every "DS-f32 vs f64" matmul speedup in this repo (12.87× / 9.55× on L40S, ~1× on H100) compares an f32-accurate result against an f64-accurate one — it is not evidence that DS is faster than f64 at comparable accuracy; README text saying "same numerical accuracy" is wrong for matmul. (2) With the plugin active, f64 user code containing a matmul silently loses ~8 to 12 digits. Elementwise ops and reductions are unaffected (~1e-14, `diag_f64_ops.py`). Not yet measured on L40S, where default precision uses a different dispatch path. Options not yet decided: leave f64 `dot_general` untransformed (correct, no speedup), or an error-free scheme such as Ozaki's (accurate, many more GEMMs).
+
 ### 6. Test Suite — Working ✅
 Confirmed 2026-06-19. Run from inside the container:
 ```bash
