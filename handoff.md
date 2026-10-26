@@ -314,6 +314,41 @@ DS error equals plain f32's to two digits at both precision settings. The four f
 
 Consequences: (1) every "DS-f32 vs f64" matmul speedup in this repo (12.87× / 9.55× on L40S, ~1× on H100) compares an f32-accurate result against an f64-accurate one — it is not evidence that DS is faster than f64 at comparable accuracy; README text saying "same numerical accuracy" is wrong for matmul. (2) With the plugin active, f64 user code containing a matmul silently loses ~8 to 12 digits. Elementwise ops and reductions are unaffected (~1e-14, `diag_f64_ops.py`). Not yet measured on L40S, where default precision uses a different dispatch path. Options not yet decided: leave f64 `dot_general` untransformed (correct, no speedup), or an error-free scheme such as Ozaki's (accurate, many more GEMMs).
 
+### 10. FMA upper bound — measured 2026-10-23 (L40S, job 49691105)
+
+`tests/bench_fma_bound.py` with the pass's `DS_FAKE_FMA_TIMING=1` (error-free product at the cost of one FMA; results deliberately wrong, timing only). Black-Scholes, median ms:
+
+| Batch | f64 | DS | DS+FMA* | f32 | f64/DS | f64/DS+FMA* | DS/DS+FMA* |
+|---|---|---|---|---|---|---|---|
+| 1,048,576 | 0.376 | 0.280 | 0.189 | 0.058 | 1.34× | 1.99× | 1.48× |
+| 16,777,216 | 4.820 | 6.371 | 6.240 | 0.726 | 0.76× | 0.77× | 1.02× |
+| 67,108,864 | 19.005 | 25.211 | 26.686 | 2.692 | 0.75× | 0.71× | 0.94× |
+
+StableHLO ops in the kernel: native 135, DS 3110, DS+FMA* 2073.
+
+An FMA cuts a third of the ops and helps 1.48× at 1M, where DS already beats f64 (1.34×; this node had no per-call floor, f32 at 0.058 ms), but does nothing at 16M and 64M. So at large batches DS is not limited by f32 arithmetic. Working hypothesis, not yet checked: XLA splits the ~3,000-op DS computation into several kernels and passes intermediates through GPU memory; at 1M those intermediates fit in the L40S's L2 cache, at 16M+ they don't. If so, the lever is fusion / memory traffic, not FMA, and adding an FMA to XLA is not worth it for speed on this kernel. Next check: count the kernels (fusions) in XLA's optimized HLO for DS Black-Scholes at 16M.
+
+### 11. Nsight profile of DS Black-Scholes (H100, 2026-10-26) and the reduce_precision split
+
+`bash tests/run_nsight.sh <label>` (Nsight Compute only; `nsys` is not in the image). 16M options, one call:
+
+| | Native f64 | DS |
+|---|---|---|
+| Kernels | 1 (`loop_select_fusion`, 327 µs, 79% DRAM) | 29: 9 full-size + 20 single-thread |
+| GPU time | 327 µs | 2,717 µs |
+
+DS breakdown: two arithmetic-bound kernels 1,617 µs (60%); two memory-bound kernels 707 µs (26%); five `wrapped_convert` kernels 315 µs (12%); twenty single-thread kernels 79 µs (3%). Max 80 registers/thread, so no sign of register pressure. The split hypothesis is confirmed, but on the H100 arithmetic dominates; the convert kernels and single-thread kernels came from the optimization barrier added in the section 8 fix (it stopped input conversions fusing and constants folding).
+
+Change (2026-10-26, verified on H100 the same day): `emitFromFloat`'s f64 path no longer uses the barrier. It computes `r = reduce_precision(v, 8 exp, 23 mant)`, `hi = f32(r)`, `lo = f32(v - r)`; XLA folding `convert(convert(r))` back to `r` is now exact, so no barrier is needed. Difference from a true conversion: values below ~1.2e-38 flush to hi = 0, lo = f32(v). Results: accuracy unchanged (f64 sum 1.7e-12; `diag_f64_ops.py` identical row for row; one structural test counted `reduce_precision` as a reduce, fixed in `tests/test_f64_ds.py`). Black-Scholes DS 2.406 → 2.123 ms at 16M (12% faster), 0.266 → 0.215 ms at 1M (19%); f64/DS 0.14× → 0.16× at 16M. Nsight, 16M, one call:
+
+| DS kernel | µs | DRAM % | SM % | regs | limited by |
+|---|---|---|---|---|---|
+| `loop_add_minimum_fusion` | 131 | 88 | 53 | 32 | memory |
+| `loop_add_convert_subtract_fusion` | 664 | 78 | 71 | 64 | memory |
+| `loop_add_fusion` | 1,630 | 23 | 75 | 86 | arithmetic |
+
+29 kernels → 3; 2,717 → 2,425 µs. XLA also merged the two former arithmetic kernels into one. On the H100, two-thirds of DS time is now one arithmetic-bound kernel that alone takes 5× native f64's whole run, so no fusion change can make DS win there; a third is two memory-bound kernels, i.e. two intermediate handoffs. Unverified guess: the cuts fall at the exp/log table gathers (the first kernel's name points at log's `minimum` index clamp).
+
 ### 6. Test Suite — Working ✅
 Confirmed 2026-06-19. Run from inside the container:
 ```bash

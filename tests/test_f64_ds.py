@@ -31,6 +31,7 @@ Usage:
   JAX_ENABLE_X64=1 JAX_PLATFORMS=cpu python3 tests/test_f64_ds.py
 """
 
+import re
 import sys
 import os
 import subprocess
@@ -213,7 +214,7 @@ def run_structural_tests():
     check("f64 sum: pass exits cleanly",
           r2.returncode == 0,
           r2.stderr[:400] if r2.returncode != 0 else "")
-    n_red = r2.stdout.count("stablehlo.reduce")
+    n_red = len(re.findall(r"stablehlo\.reduce\b(?!_)", r2.stdout))  # not reduce_precision
     check(f"f64 sum → 1 DS reduce op (got {n_red})",
           n_red == 1,
           "reduce handler should emit exactly one 4-arg DS reduce")

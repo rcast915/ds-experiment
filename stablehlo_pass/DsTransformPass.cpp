@@ -113,13 +113,14 @@ static RankedTensorType toF32Type(RankedTensorType t) {
 // return (hi, lo) pairs.  They expand directly to stablehlo ops — no custom
 // calls — so XLA sees and can fuse the arithmetic.
 
-// True if v is a constant, or a convert/broadcast of one -- i.e. something
+// True if v is a constant, or a convert/broadcast/reduce_precision of one -- i.e. something
 // XLA's constant folding will turn into a plain constant.
 static bool isConstantLike(Value v) {
     while (Operation* def = v.getDefiningOp()) {
         if (isa<stablehlo::ConstantOp>(def)) return true;
         if (!isa<stablehlo::ConvertOp>(def) &&
-            !isa<stablehlo::BroadcastInDimOp>(def)) return false;
+            !isa<stablehlo::BroadcastInDimOp>(def) &&
+            !isa<stablehlo::ReducePrecisionOp>(def)) return false;
         v = def->getOperand(0);
     }
     return false;
@@ -190,30 +191,9 @@ static std::pair<Value, Value> emitSplit(OpBuilder& bld, Location loc, Value a) 
 // two_prod(a, b) → (p, e)  using the Veltkamp split (constant 4097)
 //   p = a * b
 //   e = ((a_hi*b_hi - p) + a_hi*b_lo + a_lo*b_hi) + a_lo*b_lo
-//
-// DS_FAKE_FMA_TIMING=1 (opt-in, off by default) -- TIMING ONLY, RESULTS ARE
-// WRONG. Replaces the error term with e = p - a: one op, standing in for
-// the single fma(a, b, -p) of an FMA-based TwoProduct, in a form XLA cannot
-// fold away (and that keeps magnitudes ordinary, so no Inf/NaN cascades).
-// Everything downstream of e is still computed, so a run with this set costs
-// what the pass would cost if StableHLO had a real FMA -- the most that
-// adding one to XLA could gain. Every value carrying a lo word is garbage
-// under this flag; never use it for accuracy.
-static bool fakeFmaTiming() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("DS_FAKE_FMA_TIMING");
-        return v && std::string(v) == "1";
-    }();
-    return enabled;
-}
-
 static std::pair<Value, Value> emitTwoProd(OpBuilder& bld, Location loc,
                                             Value a, Value b) {
     Value p = bld.create<stablehlo::MulOp>(loc, a, b);
-    if (fakeFmaTiming()) {
-        Value e = bld.create<stablehlo::SubtractOp>(loc, p, a);
-        return {p, e};
-    }
     auto [a_hi, a_lo] = emitSplit(bld, loc, a);
     auto [b_hi, b_lo] = emitSplit(bld, loc, b);
     Value e = bld.create<stablehlo::AddOp>(loc,
@@ -870,29 +850,33 @@ static std::pair<Value, Value> emitFromFloat(OpBuilder& bld, Location loc,
 
     // f64 path
     //
-    // hi is the narrowed value BEHIND an optimization barrier, and every
-    // use of hi goes through that barrier. XLA folds
-    // convert(convert(v, f32), f64) straight back to v -- narrow-then-widen
-    // treated as an identity, which it is not unless v already fits in
-    // f32. The fold is a peephole on the convert-feeds-convert adjacency
-    // itself, so the barrier has to sit between the two converts; one
-    // placed after the widening convert is too late.
+    // r = v rounded to f32 precision but kept in f64 (reduce_precision with
+    // f32's 8 exponent / 23 mantissa bits). r fits in f32 exactly, so
+    //   hi = f32(r)        exact
+    //   lo = f32(v - r)    v - r is exact in f64 and fits in f32
     //
-    // Two places widen hi back to f64, and both need the barrier:
-    //   - here, for lo = v - f64(hi). Folded, this becomes v - v = 0.
-    //   - emitToFloat at func.return, for f64(hi) + f64(lo). Folded, this
-    //     becomes v + f64(lo): the result is off by lo, an f32-level error.
-    //     Observed on GPU when only the first use was barriered: `x + 0.0`
-    //     on f64 inputs came back accurate to 2^-24, and the small helper
-    //     modules JAX compiles ahead of a jitted function (which the plugin
-    //     also transforms) shifted their f64 outputs by lo before the
-    //     user's function ever ran.
-    Value hi_raw = bld.create<stablehlo::ConvertOp>(loc, f32Ty, v);
-    Value hi = bld.create<stablehlo::OptimizationBarrierOp>(
-        loc, TypeRange{f32Ty}, ValueRange{hi_raw})->getResult(0);
-    Value hi_as_f64 = bld.create<stablehlo::ConvertOp>(loc, ty, hi);
-    Value diff      = bld.create<stablehlo::SubtractOp>(loc, v, hi_as_f64);
-    Value lo        = bld.create<stablehlo::ConvertOp>(loc, f32Ty, diff);
+    // Why not hi = f32(v), lo = f32(v - f64(hi)): XLA folds
+    // convert(convert(v, f32), f64) straight back to v, treating
+    // narrow-then-widen as an identity, which it is not unless v already
+    // fits in f32. That made lo = v - v = 0, and at func.return made
+    // f64(hi) + f64(lo) = v + lo. Blocking the fold with an optimization
+    // barrier fixed the values but cost speed: the barrier forced each
+    // input's conversion into its own GPU kernel and stopped constants from
+    // folding (Nsight on H100, 16M-option Black-Scholes: five standalone
+    // convert kernels plus twenty single-thread kernels, ~15% of DS time).
+    //
+    // With r the fold is harmless. The only narrow-then-widen left is
+    // convert(convert(r, f32), f64), and folding that to r is exact.
+    //
+    // One difference from a true f32 conversion: XLA's reduce_precision
+    // flushes values below f32's smallest normal (~1.2e-38) to zero instead
+    // of rounding them to an f32 subnormal. For such v, hi = 0 and
+    // lo = f32(v), so the pair carries v at f32 (subnormal) precision.
+    Value r  = bld.create<stablehlo::ReducePrecisionOp>(
+        loc, ty, v, bld.getI32IntegerAttr(8), bld.getI32IntegerAttr(23));
+    Value hi = bld.create<stablehlo::ConvertOp>(loc, f32Ty, r);
+    Value lo = bld.create<stablehlo::ConvertOp>(loc, f32Ty,
+                   bld.create<stablehlo::SubtractOp>(loc, v, r));
     return {hi, lo};
 }
 
