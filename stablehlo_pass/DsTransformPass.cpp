@@ -191,9 +191,31 @@ static std::pair<Value, Value> emitSplit(OpBuilder& bld, Location loc, Value a) 
 // two_prod(a, b) → (p, e)  using the Veltkamp split (constant 4097)
 //   p = a * b
 //   e = ((a_hi*b_hi - p) + a_hi*b_lo + a_lo*b_hi) + a_lo*b_lo
+//
+// DS_FAKE_FMA_TIMING=1 (opt-in, off by default) -- TIMING ONLY, RESULTS ARE
+// WRONG. Replaces the error term with e = p - a: one op, standing in for
+// the single fma(a, b, -p) of an FMA-based TwoProduct, in a form XLA cannot
+// fold away (and that keeps magnitudes ordinary, so no Inf/NaN cascades).
+// Everything downstream of e is still computed, so a run with this set costs
+// what the pass would cost if StableHLO had a real FMA -- the most that
+// adding one to XLA could gain. Every value carrying a lo word is garbage
+// under this flag; never use it for accuracy. Used by
+// tests/bench_fma_bound.py.
+static bool fakeFmaTiming() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("DS_FAKE_FMA_TIMING");
+        return v && std::string(v) == "1";
+    }();
+    return enabled;
+}
+
 static std::pair<Value, Value> emitTwoProd(OpBuilder& bld, Location loc,
                                             Value a, Value b) {
     Value p = bld.create<stablehlo::MulOp>(loc, a, b);
+    if (fakeFmaTiming()) {
+        Value e = bld.create<stablehlo::SubtractOp>(loc, p, a);
+        return {p, e};
+    }
     auto [a_hi, a_lo] = emitSplit(bld, loc, a);
     auto [b_hi, b_lo] = emitSplit(bld, loc, b);
     Value e = bld.create<stablehlo::AddOp>(loc,

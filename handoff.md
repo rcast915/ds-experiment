@@ -349,6 +349,21 @@ Change (2026-10-26, verified on H100 the same day): `emitFromFloat`'s f64 path n
 
 29 kernels → 3; 2,717 → 2,425 µs. XLA also merged the two former arithmetic kernels into one. On the H100, two-thirds of DS time is now one arithmetic-bound kernel that alone takes 5× native f64's whole run, so no fusion change can make DS win there; a third is two memory-bound kernels, i.e. two intermediate handoffs. Unverified guess: the cuts fall at the exp/log table gathers (the first kernel's name points at log's `minimum` index clamp).
 
+### 12. L40S after the reduce_precision split — DS beats native f64 on Black-Scholes (2026-10-26, job 49853294)
+
+`tests/run_full.sh` on Bridges-2 L40S; all suites, pair-accuracy runs and diagnostics pass. Black-Scholes, median ms:
+
+| Batch | f64 | DS | f32 | f64/DS | f64 relerr | DS relerr | f32 relerr |
+|---|---|---|---|---|---|---|---|
+| 1,024 | 0.057 | 0.064 | 0.058 | 0.88× | 2.3e-14 | 3.2e-11 | 1.2e-03 |
+| 65,536 | 0.088 | 0.082 | 0.056 | 1.07× | 4.8e-13 | 1.9e-10 | 7.8e-03 |
+| 1,048,576 | 0.378 | 0.210 | 0.058 | 1.80× | 1.1e-11 | 2.3e-10 | 7.9e-03 |
+| 16,777,216 | 4.817 | 3.802 | 0.727 | 1.27× | 1.2e-11 | 3.6e-10 | 9.8e-03 |
+
+At 16M, DS went from 6.37 ms (2026-10-23, barrier split, 0.76× of f64) to 3.80 ms (1.27×), a 40% cut from removing the barrier alone; native f64 was 4.82 ms both times, so the runs are comparable. On the H100 the same change gave only 12%, consistent with the L40S being bound by memory traffic (lower bandwidth) where the H100 is bound by arithmetic. Accuracy is unchanged. This node had no per-call floor (f32 at 0.058 ms).
+
+Matmul on L40S (`diag_f64_matmul.py`): DS is f32-accurate here too, 2.9e-4 at default precision (TF32) and 4.7e-7 at HIGHEST; speed vs f64 12.69× default / 6.96× HIGHEST at 2048². The matmul caveat in section 9 holds on both GPUs.
+
 ### 6. Test Suite — Working ✅
 Confirmed 2026-06-19. Run from inside the container:
 ```bash

@@ -46,6 +46,7 @@ from bench_blackscholes import _BENCH_CODE  # noqa: E402  (the Black-Scholes pay
 
 WARMUP_REPS = 5
 BENCH_REPS  = 50
+REPEATS     = 3      # independent subprocess runs per configuration; median reported
 BATCH_SIZES = [1_048_576, 16_777_216, 67_108_864]
 
 # The kernel alone (the payload's definitions, without its benchmark loop),
@@ -89,6 +90,15 @@ def count_ops() -> dict:
 
 
 def run_bench(n: int, dtype: str, bypass: bool, fake_fma: bool) -> dict:
+    """Median over REPEATS separate runs, plus the spread across them."""
+    runs = [r for r in (run_once(n, dtype, bypass, fake_fma) for _ in range(REPEATS)) if r]
+    if not runs:
+        return {}
+    meds = sorted(r["median"] for r in runs)
+    return {"median": meds[len(meds) // 2], "lo": meds[0], "hi": meds[-1], "runs": len(meds)}
+
+
+def run_once(n: int, dtype: str, bypass: bool, fake_fma: bool) -> dict:
     env = dict(os.environ)
     env["JAX_ENABLE_X64"] = "1"
     if bypass:
@@ -125,7 +135,7 @@ if __name__ == "__main__":
 
     print("=" * 92)
     print("  FMA upper bound — Black-Scholes, native f64 vs DS vs DS with FMA-cost products")
-    print(f"  warmup={WARMUP_REPS}, reps={BENCH_REPS}, median reported")
+    print(f"  warmup={WARMUP_REPS}, reps={BENCH_REPS}, {REPEATS} independent runs per cell; median of run medians")
     print("  DS+FMA* = DS_FAKE_FMA_TIMING=1: timing only, its results are deliberately wrong")
     print("=" * 92)
 
@@ -146,9 +156,14 @@ if __name__ == "__main__":
         f32  = run_bench(n, "float32", bypass=True,  fake_fma=False)
         print(f"  {n:>12,}  {ms(f64)}  {ms(ds)}  {ms(fma)}  {ms(f32)}"
               f"  {ratio(f64, ds)}  {ratio(f64, fma):>11}  {ratio(ds, fma):>10}")
+        spreads = "  ".join(
+            f"{lbl} ±{100 * (d['hi'] - d['lo']) / d['median']:.0f}%" if d else f"{lbl} -"
+            for lbl, d in (("f64", f64), ("DS", ds), ("DS+FMA*", fma), ("f32", f32)))
+        print(f"  {'':>12}  spread: {spreads}")
 
     print()
     print("Notes:")
     print("  f64/X > 1 means X is faster than native f64.")
     print("  DS/DS+FMA* is the speedup a real FMA could give DS at most.")
+    print("  Spread: each time is the median of several independent runs; the ±% below is (max-min)/median.")
     print("  If f64/DS+FMA* is below 1, an FMA in XLA cannot make DS beat native f64 here.")
