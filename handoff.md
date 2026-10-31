@@ -448,7 +448,26 @@ Fixed (verified on H100 2026-10-31): ConvertOp between float types now carries t
 | 4096 | DS native | 140.1 | 0.95× | 7.0e-14 | 6.3e-14 | 4.8e-11 | 1.1e-14 |
 | 4096 | f32 | 23.8 | 5.58× | 7.1e-4 | 1.7e-4 | 3.2e-4 | 6.8e-5 |
 
-DS is now genuinely DS (errors ~1e-13, distinct from f64) and f64-class; native f32 (TF32 matmuls) loses up to 1.2e-2 electrons across sizes. DS time at 4096 = 50 × ~35 ms kernel, as predicted; the H100 is the counter-example. L40S projection: f64 ~50 × 100 ms ≈ 5 s vs DS ≈ 1.8 s, i.e. ~2.5–3× — to be measured.
+DS is now genuinely DS (errors ~1e-13, distinct from f64) and f64-class; native f32 (TF32 matmuls) loses up to 1.2e-2 electrons across sizes. DS time at 4096 = 50 × ~35 ms kernel, as predicted; the H100 is the counter-example. L40S projection: f64 ~50 × 100 ms ≈ 5 s vs DS ≈ 1.8 s, i.e. ~2.5–3×.
+
+**L40S (Bridges-2, job 50068486, `results/NVIDIA-L40S_purification_50068486.txt`)** — projection confirmed. Coverage OK.
+
+| n | run | ms | vs f64 | ‖P−Pexact‖ | ‖P²−P‖ | electrons lost | energy err |
+|---|---|---|---|---|---|---|---|
+| 1024 | f64 | 81.5 | 1.00× | 9.2e-15 | 2.3e-15 | 2.3e-13 | 4.4e-16 |
+| 1024 | DS | 27.2 | **2.99×** | 2.1e-13 | 7.7e-14 | 1.5e-11 | 2.0e-14 |
+| 1024 | DS native | 81.2 | 1.00× | 9.4e-14 | 9.2e-14 | 2.1e-11 | 2.8e-14 |
+| 1024 | f32 | 1.8 | 44.8× | 7.0e-4 | 1.6e-4 | 2.0e-3 | 6.3e-5 |
+| 2116 | f64 | 714.1 | 1.00× | 1.6e-14 | 1.5e-15 | 4.5e-13 | 1.3e-15 |
+| 2116 | DS | 239.6 | **2.98×** | 2.7e-13 | 2.9e-14 | 4.5e-13 | 1.5e-14 |
+| 2116 | DS native | 717.6 | 1.00× | 4.9e-14 | 4.3e-14 | 1.8e-11 | 9.3e-15 |
+| 2116 | f32 | 13.4 | 53.2× | 7.1e-4 | 1.6e-4 | 6.1e-3 | 6.4e-5 |
+| 4096 | f64 | 4880.0 | 1.00× | 2.8e-14 | 3.6e-15 | 2.7e-12 | 3.9e-15 |
+| 4096 | DS | 1790.1 | **2.73×** | 3.9e-13 | 1.3e-13 | 9.3e-11 | 4.4e-16 |
+| 4096 | DS native | 4925.4 | 0.99× | 7.0e-14 | 6.3e-14 | 4.8e-11 | 1.1e-14 |
+| 4096 | f32 | 78.7 | 62.0× | 7.1e-4 | 1.7e-4 | 3.0e-3 | 6.6e-5 |
+
+Headline for the paper: an unmodified JAX purification code runs **2.7–3.0× faster than native f64 on the L40S at f64-class accuracy** (‖P−Pexact‖ ~1e-13 vs 7e-4 for f32; electron count kept to ≤1e-10 vs up to 6e-3 lost by f32). DS errors are bit-identical between H100 and L40S at n=4096 (deterministic kernel). DS elementwise overhead is negligible: "DS native" ≈ f64. Single run; repeat on a quiet node before freezing numbers.
 
 ### 6. Test Suite — Working ✅
 Confirmed 2026-06-19. Run from inside the container:
