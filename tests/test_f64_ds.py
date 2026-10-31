@@ -279,6 +279,27 @@ def run_structural_tests():
           r7.returncode == 0 and "ds_gemm" not in r7.stdout and "stablehlo.dot_general" in r7.stdout,
           r7.stderr[:400] if r7.returncode != 0 else "the kernel only handles plain A[M,K]@B[K,N]")
 
+    # ── 2d. float converts must not cut the DS chain ─────────────────────────
+    # (x*x) in f32 is exact as a DS pair; widening it to f64 must keep the lo
+    # word. Before converts were handled, JAX's float converts (e.g. around
+    # jnp.where) silently dropped values back to native precision.
+    a32 = jax.ShapeDtypeStruct((16,), jnp.float32)
+
+    def fn_widen(x):
+        return (x * x).astype(jnp.float64) + 1.0
+
+    def fn_where(P, c):
+        return jnp.where(c >= 0.5, P * 2.0, P)
+
+    for name, mlir in (("(x*x).astype(f64) + 1", lower_to_mlir(fn_widen, a32)),
+                       ("jnp.where(c >= 0.5, 2P, P)",
+                        lower_to_mlir(fn_where, a64, jax.ShapeDtypeStruct((), jnp.float64)))):
+        rc = run_pass(mlir, extra_env={"DS_WARN_UNSUPPORTED": "1"})
+        warns = [l for l in rc.stderr.splitlines() if "unsupported op" in l]
+        check(f"{name}: no untransformed ops (got {len(warns)})",
+              rc.returncode == 0 and not warns,
+              (rc.stderr[:400] if rc.returncode != 0 else "\n         ".join(warns[:3])))
+
     r4 = run_pass(mm_in, extra_env={"DS_F32_MATMUL": "1"})
     n_dot4 = r4.stdout.count("stablehlo.dot_general")
     check(f"f64 matmul with DS_F32_MATMUL=1 → 4 f32 sub-matmuls (got {n_dot4})",
@@ -383,6 +404,18 @@ def run_gpu_tests():
     check(f"f64 (A*A)@B through plugin [{path}]: f64-accurate (rel err {rel:.2e} < 1e-12)",
           rel < 1e-12,
           "a value near 1e-7 or 3e-4 means the f32-accurate decomposition ran")
+
+    # ── 3c'. DS survives a widening convert ───────────────────────────────────
+    @jax.jit
+    def widen_fn(x):
+        return (x * x).astype(jnp.float64)
+
+    x32 = np.random.default_rng(5).uniform(1.0, 2.0, 4096).astype(np.float32)
+    got = np.array(block(widen_fn(jnp.array(x32))))
+    exact = x32.astype(np.float64) ** 2          # exact: 24-bit x 24-bit fits in f64
+    check("(x*x).astype(f64) on f32 x through plugin: exact (DS pair kept across convert)",
+          bool(np.all(got == exact)),
+          f"max abs err {np.max(np.abs(got - exact)):.2e}; plain f32 would be ~1e-7 relative")
 
     # ── 3d. NaN propagation ───────────────────────────────────────────────────
     a_nan = jnp.array([1.0, float('nan'), 3.0], dtype=jnp.float64)

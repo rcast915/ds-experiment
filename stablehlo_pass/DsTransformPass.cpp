@@ -18,6 +18,8 @@
 //   stablehlo.sqrt      → ds_sqrt (ported from double_binary32_sqrt)
 //   stablehlo.exponential → ds_exp (ported from double-single-libm's expds)
 //   stablehlo.log       → ds_log  (ported from double-single-libm's logds)
+//   stablehlo.convert (float → float) → DS pair carried through (narrowing
+//                         f64 → f32 rounds to f32)
 //   stablehlo.negate    → ds_negate (negate both components)
 //   stablehlo.abs       → ds_abs  (conditional negate, ported from
 //                         double-single-lib's double_binary32_fabs)
@@ -989,11 +991,9 @@ struct DsTransformPass
     }
 
     // ── Core: walk ops and replace float arithmetic ───────────────────────
-    void processOps(func::FuncOp func) {
+    void processOps(func::FuncOp func, ArrayRef<Operation*> origOps) {
         // Snapshot ops first — same trick as Skeleton.cpp — so newly inserted
         // ops are not re-visited.
-        SmallVector<Operation*> origOps;
-        func.walk([&](Operation* op) { origOps.push_back(op); });
 
         SmallVector<Operation*> toErase;
 
@@ -1160,6 +1160,33 @@ struct DsTransformPass
                 auto [a_hi, a_lo] = dsMap[logOp.getOperand()];
                 auto [r_hi, r_lo] = emitDsLog(b, loc, a_hi, a_lo);
                 dsMap[logOp.getResult()] = {r_hi, r_lo};
+                toErase.push_back(op);
+                continue;
+            }
+
+            // ── stablehlo.convert between float types ────────────────────
+            // JAX inserts float-to-float converts around jnp.where, weak-typed
+            // scalars and the like (often f64 -> f64). Left untransformed, each
+            // one cuts the DS chain: the ops after it see the plain value, and
+            // everything downstream -- matmuls included -- runs at native
+            // precision (seen in the purification benchmark: only the first
+            // iteration's matmuls reached the DS kernel). Same type or f32 ->
+            // f64 widening is exact, so the pair carries over unchanged; f64 ->
+            // f32 narrowing is the program asking for f32 rounding, so the
+            // result is that rounded value with a zero lo word.
+            if (auto cvt = dyn_cast<stablehlo::ConvertOp>(op)) {
+                if (!isFloatTensor(cvt.getResult())) continue;
+                if (!dsMap.count(cvt.getOperand())) continue;
+
+                auto [a_hi, a_lo] = dsMap[cvt.getOperand()];
+                Type inEl = cast<RankedTensorType>(cvt.getOperand().getType()).getElementType();
+                Type outEl = cast<RankedTensorType>(cvt.getResult().getType()).getElementType();
+                if (inEl.isF64() && outEl.isF32()) {
+                    Value r = b.create<stablehlo::AddOp>(loc, a_hi, a_lo);
+                    dsMap[cvt.getResult()] = {r, emitSplat(b, loc, r, 0.0f)};
+                } else {
+                    dsMap[cvt.getResult()] = {a_hi, a_lo};
+                }
                 toErase.push_back(op);
                 continue;
             }
@@ -1617,8 +1644,14 @@ struct DsTransformPass
         f32AccurateF64Matmul = fm && std::string(fm) == "1";
         const char* gk = std::getenv("DS_GEMM_KERNEL_AVAILABLE");
         dsGemmKernel = gk && std::string(gk) == "1";
+        // Snapshot the program's own ops BEFORE convertFuncArgs inserts the
+        // argument splits, so the walk below never treats the pass's own
+        // converts / reduce_precision as user ops (it would both mis-report
+        // them as unsupported and, for converts, re-process them).
+        SmallVector<Operation*> origOps;
+        func.walk([&](Operation* op) { origOps.push_back(op); });
         convertFuncArgs(func);
-        processOps(func);
+        processOps(func, origOps);
     }
 };
 

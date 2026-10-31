@@ -27,7 +27,7 @@ OUT="results/$(echo "$gpu" | tr -c 'A-Za-z0-9\n' '-')_fma-bound_${1:-$(date +%Y%
     cmake -GNinja -S stablehlo_pass -B stablehlo_pass/build -DCMAKE_CXX_FLAGS="-fno-rtti" > /dev/null \
         && ninja -C stablehlo_pass/build || exit 1
     PJRT_NAMES_AND_LIBRARY_PATHS="cuda:$PWD/pjrt_plugin/build/libds_pjrt_plugin.so" \
-        python3 tests/bench_fma_bound.py
+        python3 -u tests/bench_fma_bound.py
 } 2>&1 | tee "$OUT"
 rc=${PIPESTATUS[0]}
 echo "[run_fma_bound] Output saved to $OUT"

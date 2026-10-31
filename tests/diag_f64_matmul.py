@@ -13,7 +13,7 @@ subprocess:
 
   f64          f64 inputs, DS_BYPASS=1                     (native f64)
   DS           f64 inputs, plugin active, default          (the DS matmul kernel,
-                                                            cpp/ds_gemm, if registered)
+                                                            cpp/ds_gemm)
   DS native    same, DS_GEMM_KERNEL=0                      (fallback: native f64 matmul)
   DS 4-GEMM    f64 inputs, plugin, DS_F32_MATMUL=1         (4-GEMM decomposition,
                                                             default precision)

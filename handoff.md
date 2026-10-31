@@ -419,8 +419,36 @@ Clears the go/no-go (≥1.5× at 2048², err < 1e-12) with 3.26× at 5.4e-14. Th
   | 1024 | 0.130 ms, 1.1e-15 | 0.691 ms, 3.8e-14 | 0.125 ms, 1.1e-15 | 0.121 ms, 2.9e-4 |
   | 2048 | 0.373 ms, 1.6e-15 | 4.579 ms, 5.4e-14 | 0.421 ms, 1.6e-15 | 0.343 ms, 2.9e-4 |
 
-  Through-JAX kernel time at 2048² (4.58 ms) matches the standalone kernel plus split (4.50 ms): integration overhead is negligible. On the H100 the kernel is 12× slower than native f64, so registering it unconditionally is the wrong default there (open decision: enable only on GPUs without fast f64).
+  Through-JAX kernel time at 2048² (4.58 ms) matches the standalone kernel plus split (4.50 ms): integration overhead is negligible. On the H100 the kernel is 12× slower than native f64, so registering it unconditionally is the wrong default there. **Decided 2026-10-31:** keep it always on when the plugin is active. The plugin is meant for GPUs with slow f64, where the elementwise rewrite is also only worthwhile; gating just the matmul would be inconsistent, and the H100 serves as the paper's counter-example with the kernel on. `DS_GEMM_KERNEL=0` turns it off. (A compute-capability gate was written and removed the same day.)
+- **L40S result (2026-10-31, job 50067337) — the end-to-end matmul result.** Kernel registered; all 7 suites pass; f64 `A @ B` through JAX:
+
+  | n | native f64 | DS kernel | speedup | DS err | DS native fallback |
+  |---|---|---|---|---|---|
+  | 256 | 0.287 ms | 0.375 ms | 0.77× | 1.9e-14 | 0.495 ms |
+  | 1024 | 2.092 ms | 0.911 ms | 2.30× | 3.8e-14 | 1.928 ms |
+  | 2048 | 12.614 ms | 4.424 ms | **2.85×** | 5.4e-14 | 12.687 ms |
+
+  f64-class accuracy (5.4e-14 vs native 1.6e-15, f32 4e-7) at 2.85× native f64 through unmodified JAX. This node again had a ~0.3–0.45 ms per-call floor, so the 256² and 1024² rows are understated; 2048² is well above it. Black-Scholes in the same run: 1.23× at 16M.
 - Main risks at first run (resolved on H100): whether the JAX 0.10.1 backend's FFI extension has `register_handler` and accepts the platform name; FFI header version skew between /opt/xla-ffi (XLA main at image build) and the backend.
+
+### 16. Purification benchmark, and float converts cutting the DS chain (2026-10-31)
+
+`tests/bench_purification.py` (`tests/run_purification.sh`): canonical density-matrix purification (Palser–Manolopoulos), 25 unrolled iterations = 50 matmuls, 2D tight-binding at half filling, n = 1024/2116/4096; accuracy vs NumPy eigh (density matrix, idempotency, electron count, band energy). NumPy check: f64 5e-15, f32 3e-6 with 4e-4 electrons lost.
+
+First H100 run: DS results were *identical* to native f64 to every digit and only ~25% slower — i.e. not DS. The coverage check showed why: JAX emits float→float `stablehlo.convert`s (f64→f64, around `jnp.where` / weak-typed scalars) that the pass didn't handle, so the DS chain was cut after the first iteration; later matmuls ran as native f64 dot_generals. (Native f32 there: 7e-4 error, 1.2e-2 electrons lost — TF32 matmuls at default precision.)
+
+Fixed (verified on H100 2026-10-31): ConvertOp between float types now carries the DS pair (f64→f32 rounds to f32 with lo = 0); the op snapshot is taken before `convertFuncArgs`, so the pass's own split ops are no longer walked (they had been reported as false "unsupported op" warnings). New tests in `test_f64_ds.py` (2d structural, 3c' GPU exactness across a widening convert). Black-Scholes may also have had such converts — rerun `run_full.sh` and compare with sections 12–13.
+
+**H100 after the fix** (`run_full.sh h100-convert`: all 7 suites pass, Black-Scholes numbers unchanged — it was not affected; `run_purification.sh h100-v2`: coverage OK, 4 kernel calls / 0 dot_general / 0 untransformed in 2 iterations):
+
+| n | run | ms | vs f64 | ‖P−Pexact‖ | ‖P²−P‖ | electrons lost | energy err |
+|---|---|---|---|---|---|---|---|
+| 4096 | f64 | 132.6 | 1.00× | 2.8e-14 | 3.6e-15 | 2.7e-12 | 3.9e-15 |
+| 4096 | DS | 1732.9 | 0.08× | 3.9e-13 | 1.3e-13 | 9.3e-11 | 4.4e-16 |
+| 4096 | DS native | 140.1 | 0.95× | 7.0e-14 | 6.3e-14 | 4.8e-11 | 1.1e-14 |
+| 4096 | f32 | 23.8 | 5.58× | 7.1e-4 | 1.7e-4 | 3.2e-4 | 6.8e-5 |
+
+DS is now genuinely DS (errors ~1e-13, distinct from f64) and f64-class; native f32 (TF32 matmuls) loses up to 1.2e-2 electrons across sizes. DS time at 4096 = 50 × ~35 ms kernel, as predicted; the H100 is the counter-example. L40S projection: f64 ~50 × 100 ms ≈ 5 s vs DS ≈ 1.8 s, i.e. ~2.5–3× — to be measured.
 
 ### 6. Test Suite — Working ✅
 Confirmed 2026-06-19. Run from inside the container:

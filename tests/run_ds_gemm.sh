@@ -42,7 +42,7 @@ NVCC="$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)"
     echo
 
     echo "=== Benchmark ==="
-    cpp/ds_gemm/build/ds_gemm_bench 256 512 1024 2048 4096
+    stdbuf -oL cpp/ds_gemm/build/ds_gemm_bench 256 512 1024 2048 4096
 } 2>&1 | tee "$OUT"
 rc=${PIPESTATUS[0]}
 echo "[run_ds_gemm] Output saved to $OUT"

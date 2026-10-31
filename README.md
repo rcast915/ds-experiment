@@ -193,7 +193,7 @@ stablehlo-legalize-to-vhlo        # convert back to VHLO for XLA
 | `DS_PASS_MODE=ffi` | Use FFI pass instead of inline pass (for debugging only) |
 | `DS_RETURN_PAIRS=1` | Skip recombination at `func.return` for a value returned exactly twice, exposing the raw `(hi, lo)` pair instead of the recombined f32/f64 result. Off by default; used by the pair-accuracy sections of `tests/test_ds_divide.py`, `tests/test_ds_sqrt.py` and `tests/test_ds_exp_log.py` |
 | `DS_WARN_UNSUPPORTED=1` | Report (via the plugin's stderr) every op that consumes a DS-tracked value but is not transformed |
-| `DS_GEMM_KERNEL=0` | Don't register the DS matmul kernel; f64 matmuls then run as native f64 |
+| `DS_GEMM_KERNEL=0` | Don't register the DS matmul kernel; f64 matmuls then run as native f64. (On GPUs with full-rate f64, such as H100, native is faster — but there the whole DS rewrite is slower than native f64, so the plugin isn't meant for them.) |
 | `DS_F32_MATMUL=1` | Rewrite f64 matmuls into the 4-GEMM DS decomposition (fast, f32-accurate) instead of keeping them native f64 |
 | `DS_FAKE_FMA_TIMING=1` | Timing only, results wrong: give each error-free product the cost of an FMA (`tests/bench_fma_bound.py`) |
 

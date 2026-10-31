@@ -215,7 +215,12 @@ static PJRT_Error* ds_compile_wrapper(PJRT_Client_Compile_Args* args) {
 // for f64 matmuls without any user code. On success, sets
 // DS_GEMM_KERNEL_AVAILABLE=1 in this process's environment; mlir-ds-opt
 // inherits it (run_command passes `environ`) and only then emits the call.
-// DS_GEMM_KERNEL=0 skips registration (f64 matmuls then run as native f64).
+//
+// Registered whenever the plugin is active: the plugin is meant for GPUs whose
+// f64 is slow, so enabling it means DS throughout, matmul included. On GPUs
+// with full-rate f64 the kernel loses to native f64 (H100: 4.58 ms vs
+// 0.37 ms at 2048^2), as the elementwise DS rewrite does there too.
+// DS_GEMM_KERNEL=0 turns the kernel off; f64 matmuls then run native.
 static void print_pjrt_error(const PJRT_Api* api, PJRT_Error* err, const char* what) {
     PJRT_Error_Message_Args m;
     memset(&m, 0, sizeof(m));
@@ -231,11 +236,14 @@ static void print_pjrt_error(const PJRT_Api* api, PJRT_Error* err, const char* w
 }
 
 static void register_ds_gemm(const PJRT_Api* api) {
-    const char* off = getenv("DS_GEMM_KERNEL");
-    if (off && std::string(off) == "0") {
+    const char* mode = getenv("DS_GEMM_KERNEL");
+    if (mode && std::string(mode) == "0") {
         fprintf(stderr, "[ds_pjrt] DS matmul kernel disabled (DS_GEMM_KERNEL=0)\n");
         return;
     }
+    int major = 0, minor = 0;   // for the log only
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0);
     const PJRT_FFI_Extension* ffi_ext = nullptr;
     for (const PJRT_Extension_Base* e = api->extension_start; e; e = e->next) {
         if (e->type == PJRT_Extension_Type_FFI) {
@@ -276,8 +284,8 @@ static void register_ds_gemm(const PJRT_Api* api) {
         PJRT_Error* err = ffi_ext->register_handler(&args);
         if (!err) {
             setenv("DS_GEMM_KERNEL_AVAILABLE", "1", 1);
-            fprintf(stderr, "[ds_pjrt] DS matmul kernel registered (target ds_gemm, platform %s)\n",
-                    platform);
+            fprintf(stderr, "[ds_pjrt] DS matmul kernel registered (target ds_gemm, platform %s; "
+                            "GPU compute capability %d.%d)\n", platform, major, minor);
             return;
         }
         print_pjrt_error(api, err, "register_handler failed");
