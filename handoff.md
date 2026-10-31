@@ -314,6 +314,8 @@ DS error equals plain f32's to two digits at both precision settings. The four f
 
 Consequences: (1) every "DS-f32 vs f64" matmul speedup in this repo (12.87× / 9.55× on L40S, ~1× on H100) compares an f32-accurate result against an f64-accurate one — it is not evidence that DS is faster than f64 at comparable accuracy; README text saying "same numerical accuracy" is wrong for matmul. (2) With the plugin active, f64 user code containing a matmul silently loses ~8 to 12 digits. Elementwise ops and reductions are unaffected (~1e-14, `diag_f64_ops.py`). Not yet measured on L40S, where default precision uses a different dispatch path. Options not yet decided: leave f64 `dot_general` untransformed (correct, no speedup), or an error-free scheme such as Ozaki's (accurate, many more GEMMs).
 
+**Decided and implemented 2026-10-31 (not yet built/run):** f64 `dot_general` now stays native f64 by default. Its DS operands are recombined to f64 (`emitToFloat`), the original op is kept, and its result is split back to DS for downstream ops; returned unchanged if it is a function result (`nativeValues`). `DS_F32_MATMUL=1` restores the 4-GEMM decomposition for f64 inputs. f32 matmuls are unchanged. Tests: `tests/test_f64_ds.py` 2c (structure, both modes) and 3c (GPU: f64 `(A*A)@B` must be < 1e-12); `tests/diag_f64_matmul.py` now shows default vs 4-GEMM columns; `tests/bench_f64_vs_ds.py` times the 4-GEMM mode explicitly and labels it f32-accurate. Remaining README matmul tables are historical and labelled as not accuracy-matched.
+
 ### 10. FMA upper bound — measured 2026-10-23 (L40S, job 49691105)
 
 `tests/bench_fma_bound.py` with the pass's `DS_FAKE_FMA_TIMING=1` (error-free product at the cost of one FMA; results deliberately wrong, timing only). Black-Scholes, median ms:
@@ -363,6 +365,62 @@ Change (2026-10-26, verified on H100 the same day): `emitFromFloat`'s f64 path n
 At 16M, DS went from 6.37 ms (2026-10-23, barrier split, 0.76× of f64) to 3.80 ms (1.27×), a 40% cut from removing the barrier alone; native f64 was 4.82 ms both times, so the runs are comparable. On the H100 the same change gave only 12%, consistent with the L40S being bound by memory traffic (lower bandwidth) where the H100 is bound by arithmetic. Accuracy is unchanged. This node had no per-call floor (f32 at 0.058 ms).
 
 Matmul on L40S (`diag_f64_matmul.py`): DS is f32-accurate here too, 2.9e-4 at default precision (TF32) and 4.7e-7 at HIGHEST; speed vs f64 12.69× default / 6.96× HIGHEST at 2048². The matmul caveat in section 9 holds on both GPUs.
+
+### 13. FMA upper bound after the barrier fix, with repeats (L40S, 2026-10-31, job 50045542)
+
+`tests/bench_fma_bound.py`, 3 independent runs per cell (median of run medians; spread 0–1% everywhere). Black-Scholes, ms:
+
+| Batch | f64 | DS | DS+FMA* | f32 | f64/DS | f64/DS+FMA* | DS/DS+FMA* |
+|---|---|---|---|---|---|---|---|
+| 1,048,576 | 0.377 | 0.199 | 0.167 | 0.057 | 1.89× | 2.26× | 1.19× |
+| 16,777,216 | 4.817 | 3.805 | 3.880 | 0.726 | 1.27× | 1.24× | 0.98× |
+| 67,108,864 | 19.005 | 17.610 | 18.412 | 2.691 | 1.08× | 1.03× | 0.96× |
+
+Ops: native 135, DS 3,094, DS+FMA* 2,057. The section 12 result reproduces (16M: 3.805 vs 3.802 ms) and holds at 64M (1.08×). An FMA still helps only at 1M (+19%); at 16M and 64M it changes nothing, so large batches remain limited by something other than f32 arithmetic, most likely memory traffic through the two remaining kernel boundaries. Not measurable with Nsight on Bridges-2 (performance counters restricted); next step is listing the kernels and their array sizes from XLA's compiled program.
+
+### 14. Standalone DS matmul kernel (option A) — H100 check (2026-10-31)
+
+`cpp/ds_gemm/` (kernel + benchmark), run with `bash tests/run_ds_gemm.sh <label>`; needs only nvcc and cuBLAS. Per term: compensated multiply-add (Ogita–Rump–Oishi Dot2 extended to DS inputs) with real FMA, ~12 f32 instructions; low word renormalized every 8 terms. Tiling 64×64×8, 256 threads, 4×4 outputs per thread; 80 registers, no spills.
+
+H100 (n×n, f64 inputs; error vs cuBLAS DGEMM, whose own error vs long double is 6e-16 to 3e-15):
+
+| n | DGEMM ms | SGEMM ms (err) | DS ms + split ms | DS err | DGEMM/DS |
+|---|---|---|---|---|---|
+| 1024 | 0.051 | 0.065 (5.7e-7) | 0.590 + 0.015 | 3.9e-14 | 0.08× |
+| 2048 | 0.300 | 0.346 (8.1e-7) | 4.445 + 0.056 | 5.4e-14 | 0.07× |
+| 4096 | 2.302 | 2.851 (1.2e-6) | 34.858 + 0.195 | 7.7e-14 | 0.07× |
+
+Accuracy is f64-class (5e-14 at 2048²), seven orders better than SGEMM. Speed on H100 is hopeless as expected (FP64 tensor cores, ~60 TFLOPS), but the kernel itself is efficient: ~12.4 instructions × n³ in 4.445 ms ≈ 24 T instr/s, roughly 70% of the H100's FP32 issue rate (estimate from the nominal 67 TFLOPS FP32 peak). Projection for L40S (nominal 91.6 TFLOPS FP32) at a similar efficiency: ~3–3.5 ms at 2048² against DGEMM's 12.2 ms, i.e. ~3×; an estimate, the L40S run decides.
+
+**L40S result (2026-10-31, job 50066814) — GO.**
+
+| n | DGEMM ms | SGEMM ms (err) | DS ms + split ms | DS err | DGEMM/DS |
+|---|---|---|---|---|---|
+| 256 | 0.072 | 0.016 (9.9e-8) | 0.076 + 0.010 | 1.9e-14 | 0.83× |
+| 512 | 0.250 | 0.022 (2.1e-7) | 0.143 + 0.010 | 2.7e-14 | 1.63× |
+| 1024 | 1.916 | 0.088 (2.1e-7) | 0.550 + 0.022 | 3.9e-14 | 3.35× |
+| 2048 | 15.222 | 0.390 (4.1e-7) | 4.476 + 0.195 | 5.4e-14 | 3.26× |
+| 4096 | 110.224 | 2.782 (6.6e-7) | 34.580 + 0.840 | 7.7e-14 | 3.11× |
+
+Clears the go/no-go (≥1.5× at 2048², err < 1e-12) with 3.26× at 5.4e-14. The DS kernel runs at about the same absolute speed as on the H100 (~3.9 TFLOP/s-equivalent), roughly half the L40S's nominal FP32 issue rate, so tuning (larger per-thread tiles, vector loads, double buffering) has room. Note cuBLAS DGEMM here (15.2 ms at 2048²) is slower than JAX/XLA's f64 matmul measured earlier on L40S (12.2 ms); compare end-to-end JAX numbers against the JAX baseline once integrated.
+
+### 15. DS matmul kernel integrated into the pass (2026-10-31; verified on H100 the same day)
+
+- `cpp/ds_gemm/ds_gemm_kernel.cuh`: the kernel, shared by the benchmark and the handler; writes f64 or a (hi, lo) pair.
+- `cpp/ds_gemm/ds_gemm_ffi.cu` → `cpp/ds_gemm/build/ffi/libds_gemm_ffi.so` (built by `ds_setup.sh` step 2b): typed XLA FFI handler `DsGemm` taking (a_hi, a_lo, b_hi, b_lo) f32 and returning (c_hi, c_lo) f32, on XLA's stream.
+- `pjrt_plugin/ds_pjrt_plugin.cpp`: at init, finds the backend's PJRT FFI extension, dlopens the library, calls `register_handler` for target `ds_gemm` (platform names tried: CUDA, cuda, gpu), and on success `setenv("DS_GEMM_KERNEL_AVAILABLE", "1")` so mlir-ds-opt (spawned with `environ`) knows. `DS_GEMM_KERNEL=0` skips it. The FFI extension header is vendored in `pjrt_plugin/third_party/` (the image only has pjrt_c_api.h).
+- Pass: f64 `dot_general` of the plain form A[M,K]@B[K,N] (rank 2, no batch dims, contracting 1×0, static shapes) → `stablehlo.custom_call @ds_gemm` (api_version 4 = typed FFI, row-major operand/result layouts), result kept as a DS pair. Otherwise native f64 (section 9). `DS_F32_MATMUL=1` still selects the old 4-GEMM path.
+- Tests: `tests/test_f64_ds.py` 2c (kernel call emitted; batched falls back; `(A*A)@B` feeds the call) and 3c (GPU accuracy < 1e-12, labels which path ran); `tests/diag_f64_matmul.py` has `DS` (kernel) and `DS native` columns.
+- **H100 result (`run_full.sh h100-kernel`):** compiled first time; plugin logs `DS matmul kernel registered (target ds_gemm, platform CUDA)`; all 7 suites pass; f64 `(A*A)@B` through JAX via the kernel: 1.96e-14. Matmul diagnostic, f64 inputs, through JAX:
+
+  | n | native f64 | DS kernel | DS native fallback | DS 4-GEMM (default prec.) |
+  |---|---|---|---|---|
+  | 256 | 0.054 ms, 5.6e-16 | 0.166 ms, 1.9e-14 | 0.055 ms, 5.6e-16 | 0.072 ms, 2.9e-4 |
+  | 1024 | 0.130 ms, 1.1e-15 | 0.691 ms, 3.8e-14 | 0.125 ms, 1.1e-15 | 0.121 ms, 2.9e-4 |
+  | 2048 | 0.373 ms, 1.6e-15 | 4.579 ms, 5.4e-14 | 0.421 ms, 1.6e-15 | 0.343 ms, 2.9e-4 |
+
+  Through-JAX kernel time at 2048² (4.58 ms) matches the standalone kernel plus split (4.50 ms): integration overhead is negligible. On the H100 the kernel is 12× slower than native f64, so registering it unconditionally is the wrong default there (open decision: enable only on GPUs without fast f64).
+- Main risks at first run (resolved on H100): whether the JAX 0.10.1 backend's FFI extension has `register_handler` and accepts the platform name; FFI header version skew between /opt/xla-ffi (XLA main at image build) and the backend.
 
 ### 6. Test Suite — Working ✅
 Confirmed 2026-06-19. Run from inside the container:

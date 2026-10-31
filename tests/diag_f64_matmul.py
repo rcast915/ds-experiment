@@ -1,17 +1,23 @@
 """
 Diagnostic: how accurate is the DS matmul, and what does it cost?
 
-The pass turns one matmul into four f32 GEMMs (hi*hi, hi*lo, lo*hi, lo*lo).
-Each GEMM rounds every product and every partial sum to f32 and none of
-that rounding is captured, so the result may be no better than plain f32
-even though the inputs are carried exactly. This script measures it.
+With DS_F32_MATMUL=1 the pass turns an f64 matmul into four f32 GEMMs
+(hi*hi, hi*lo, lo*hi, lo*lo). Each GEMM rounds every product and every
+partial sum to f32 and none of that rounding is captured, so the result is
+no better than plain f32 even though the inputs are carried exactly. By
+default the pass therefore keeps f64 matmuls native. This script measures
+both.
 
-For A @ B on random n x n matrices, five configurations, each in its own
+For A @ B on random n x n matrices, seven configurations, each in its own
 subprocess:
 
   f64          f64 inputs, DS_BYPASS=1                     (native f64)
-  DS           f64 inputs, plugin active, default precision
-  DS highest   f64 inputs, plugin active, precision=HIGHEST
+  DS           f64 inputs, plugin active, default          (the DS matmul kernel,
+                                                            cpp/ds_gemm, if registered)
+  DS native    same, DS_GEMM_KERNEL=0                      (fallback: native f64 matmul)
+  DS 4-GEMM    f64 inputs, plugin, DS_F32_MATMUL=1         (4-GEMM decomposition,
+                                                            default precision)
+  4-GEMM hi    same, precision=HIGHEST
   f32          f32 inputs, DS_BYPASS=1, default precision  (native f32)
   f32 highest  f32 inputs, DS_BYPASS=1, precision=HIGHEST
 
@@ -22,8 +28,10 @@ Reported per configuration and size:
            input values the run saw
 
 Reading the result: native f64 lands near 1e-16 and native f32 near 1e-7.
-If DS is near 1e-7 too, its matmul is f32-accurate and its speed advantage
-over f64 is not a like-for-like comparison.
+"DS" (the kernel) should be ~1e-13 and, on GPUs with weak f64, faster than
+native f64; "DS native" should match native f64 in time and accuracy. The 4-GEMM columns
+show the opt-in decomposition: fast, but f32-accurate (~1e-7, or ~3e-4 at
+default precision on GPUs that use TF32).
 
 Usage (inside container, after ds_setup.sh):
   PJRT_NAMES_AND_LIBRARY_PATHS="cuda:/src/ds_experiment/pjrt_plugin/build/libds_pjrt_plugin.so" \\
@@ -86,17 +94,23 @@ print("RESULT " + json.dumps(out))
 """
 
 CONFIGS = [
-    # label,         dtype,     precision, bypass
-    ("f64",          "float64", "default", True),
-    ("DS",           "float64", "default", False),
-    ("DS highest",   "float64", "highest", False),
-    ("f32",          "float32", "default", True),
-    ("f32 highest",  "float32", "highest", True),
+    # label,         dtype,     precision, bypass, extra env
+    ("f64",          "float64", "default", True,   {}),
+    ("DS",           "float64", "default", False,  {}),
+    ("DS native",    "float64", "default", False,  {"DS_GEMM_KERNEL": "0"}),
+    ("DS 4-GEMM",    "float64", "default", False,  {"DS_F32_MATMUL": "1"}),
+    ("4-GEMM hi",    "float64", "highest", False,  {"DS_F32_MATMUL": "1"}),
+    ("f32",          "float32", "default", True,   {}),
+    ("f32 highest",  "float32", "highest", True,   {}),
 ]
 
 
-def run(dtype: str, precision: str, bypass: bool) -> dict:
+def run(dtype: str, precision: str, bypass: bool, extra_env: dict) -> dict:
     env = dict(os.environ)
+    env.pop("DS_F32_MATMUL", None)
+    env.pop("DS_GEMM_KERNEL", None)
+    env.pop("DS_GEMM_KERNEL_AVAILABLE", None)
+    env.update(extra_env)
     env["JAX_ENABLE_X64"] = "1"
     if bypass:
         env["DS_BYPASS"] = "1"
@@ -118,8 +132,8 @@ if __name__ == "__main__":
         print("Needs the PJRT plugin (set PJRT_NAMES_AND_LIBRARY_PATHS).")
         sys.exit(1)
 
-    results = {label: run(dtype, precision, bypass)
-               for label, dtype, precision, bypass in CONFIGS}
+    results = {label: run(dtype, precision, bypass, extra)
+               for label, dtype, precision, bypass, extra in CONFIGS}
 
     print("\nA @ B, random normal n x n  (ms = median wall time; "
           "relerr = ||C - T||_F / ||T||_F vs NumPy f64)\n")
@@ -144,11 +158,11 @@ if __name__ == "__main__":
     for n in SIZES:
         f64 = results["f64"].get(str(n), {})
         parts = []
-        for label in ("DS", "DS highest"):
+        for label in ("DS", "DS native", "DS 4-GEMM", "4-GEMM hi"):
             ds = results[label].get(str(n), {})
             if "ms" in f64 and "ms" in ds and ds["ms"] > 0:
                 parts.append(f"{label}: {f64['ms'] / ds['ms']:.2f}x")
         print(f"    n={n:<5} " + "   ".join(parts))
 
     print("\n  Native f64 should be ~1e-16 and native f32 ~1e-7.")
-    print("  DS near 1e-7 = its matmul is f32-accurate, not f64-accurate.")
+    print("  DS should match f64. 4-GEMM near 1e-7 = f32-accurate (opt-in mode, DS_F32_MATMUL=1).")

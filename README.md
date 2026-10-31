@@ -37,25 +37,22 @@ The core claim is: **DS-f32 achieves near-f64 numerical accuracy at
 approximately f32 hardware cost.**  What "f32 cost" means in practice
 depends on the target:
 
-- On **consumer GPUs and hardware without native f64 units** (mobile,
-  embedded), f64 throughput is typically 1/32–1/64 of f32 throughput.
-  DS-f32 runs at f32 speed on those paths, making it dramatically faster
-  than f64 while preserving near-f64 accuracy.
-- On **HPC GPUs with native f64 units (e.g. H100)**, the picture is more
-  nuanced than earlier measurements suggested. At default matmul
-  precision, wall times are comparable (within ~10%) — but default
-  precision lets cuBLAS silently select a faster, reduced-precision
-  algorithm for the f32 sub-matmuls (confirmed directly, not inferred:
-  cuBLAS picks a different `selected_algorithm` per precision setting),
-  which is not the precision this project's own accuracy claims are
-  validated under. At `precision=HIGHEST` — the setting actually used to
-  validate accuracy — DS-f32 measured **4× slower** than native f64 at
-  2048² on H100. GPUs **without** native f64 tensor cores (e.g. L40S) are
-  where DS-f32's speed advantage actually holds up under matched
-  precision: **6.87× faster** than f64 at 2048² at `precision=HIGHEST`
-  (down from a default-precision 12.76×, but still a clear, real win),
-  since f64 is CUDA-core-bound there regardless of precision setting. See
-  **"Matched-precision results"** below for both GPUs.
+- **Where f64 is expensive, DS can beat it at f64-class accuracy.** On an
+  NVIDIA L40S, DS runs a Black-Scholes kernel (PARSEC) 1.08×–1.89× faster
+  than native f64 for 1M–64M options, with price errors of about 2–4e-10
+  against 1e-11 for f64 and 1e-2 for f32, reproducible to within 1% across
+  runs (`handoff.md` sections 12–13).
+- **Where f64 is cheap, it can't.** On an H100, which has strong f64
+  hardware, the same kernel runs at about 0.16× of native f64. Whether DS
+  wins comes down to how much more a GPU charges for f64 than for f32,
+  compared with DS's own cost over f32.
+- **Matmul is the exception.** The 4-GEMM DS decomposition is fast on
+  GPUs with weak f64 (up to ~13× over f64 on L40S at 2048²) but only
+  f32-accurate, because the f32 library GEMMs round every product and
+  partial sum to f32 (`tests/diag_f64_matmul.py`). f64 matmuls therefore
+  run as native f64 by default; `DS_F32_MATMUL=1` opts into the fast,
+  f32-accurate version. Earlier matmul speedups in this README compare that
+  f32-accurate result against f64 and are not like-for-like.
 - In **all cases**, DS-f32 is substantially more accurate than plain f32:
   measured **8× lower error** for large reductions (~1.49e-05 vs ~1.22e-04
   for a 10,000-element reduction).
@@ -135,7 +132,7 @@ values to their DS pair `(hi, lo)`. Transformations:
 | `stablehlo.select` | Same predicate applied to `hi` and `lo` |
 | `stablehlo.maximum` / `stablehlo.minimum` | DS compare + select |
 | `stablehlo.reduce` (single-input, add/sub/mul body) | New 4-arg f32 reduce body using the DS version of the body op |
-| `stablehlo.dot_general` | 4 f32 sub-matmuls: `p=dot(hi,hi)`, `e1=dot(hi,lo)`, `e2=dot(lo,hi)`, `e3=dot(lo,lo)`, then `two_sum(p, e1+e2+e3)` |
+| `stablehlo.dot_general` | **f64, plain `A[M,K]@B[K,N]`:** `custom_call @ds_gemm`, the DS matmul kernel in `cpp/ds_gemm` (registered by the plugin; ~5e-14 accuracy, ~3× native f64 on L40S standalone). **Other f64 forms, or kernel unavailable:** native f64 matmul (operands recombined to f64, result split back to DS). **f32, or f64 with `DS_F32_MATMUL=1`:** 4 f32 sub-matmuls `dot(hi,hi)`, `dot(hi,lo)`, `dot(lo,hi)`, `dot(lo,lo)`, then `two_sum` — f32-accurate |
 | **`func.return`** | Recombine via `emitToFloat`: **`cast(hi, f64) + cast(lo, f64)`** → f64 output |
 
 All expanded ops are native StableHLO, so XLA sees a single fused kernel
@@ -196,6 +193,9 @@ stablehlo-legalize-to-vhlo        # convert back to VHLO for XLA
 | `DS_PASS_MODE=ffi` | Use FFI pass instead of inline pass (for debugging only) |
 | `DS_RETURN_PAIRS=1` | Skip recombination at `func.return` for a value returned exactly twice, exposing the raw `(hi, lo)` pair instead of the recombined f32/f64 result. Off by default; used by the pair-accuracy sections of `tests/test_ds_divide.py`, `tests/test_ds_sqrt.py` and `tests/test_ds_exp_log.py` |
 | `DS_WARN_UNSUPPORTED=1` | Report (via the plugin's stderr) every op that consumes a DS-tracked value but is not transformed |
+| `DS_GEMM_KERNEL=0` | Don't register the DS matmul kernel; f64 matmuls then run as native f64 |
+| `DS_F32_MATMUL=1` | Rewrite f64 matmuls into the 4-GEMM DS decomposition (fast, f32-accurate) instead of keeping them native f64 |
+| `DS_FAKE_FMA_TIMING=1` | Timing only, results wrong: give each error-free product the cost of an FMA (`tests/bench_fma_bound.py`) |
 
 ---
 
@@ -274,7 +274,9 @@ main claim shows up directly.
 | `jnp.matmul` 2048×2048 | 12.19 | 0.95 | **12.87×** |
 
 At 2048×2048, native f64 achieves only ~1.4 TFLOPS while DS-f32 achieves
-~18 TFLOPS — DS-f32 is **nearly 13× faster** with the same numerical accuracy.
+~18 TFLOPS — DS-f32 is **nearly 13× faster**, but this DS matmul is only
+f32-accurate (measured later, `tests/diag_f64_matmul.py`), so it is not an
+accuracy-matched comparison. f64 matmuls now run as native f64 by default.
 
 Element-wise and reduction workloads show little or no speedup because those
 are memory-bandwidth-bound: both f64 and DS-f32 saturate memory bandwidth,
@@ -636,15 +638,30 @@ is materialized back to f32 at module boundaries, losing precision at every
 op. Inside a `jax.jit` block the entire function is one module, so DS pairs
 propagate through all operations before the final f32 output.
 
-### dot_general limitation
+### dot_general: native f64 by default
 
-`stablehlo.dot_general` benefits only when at least one input has a non-zero
-`lo` channel — i.e., when a prior `mul`, `add`, or `reduce` in the same JIT
-block has created it. A standalone `a @ b` with no prior DS ops has `lo=0`
-for both inputs, so all four correction matmuls contribute zero, and the
-result is identical to plain f32. Materializing two-product error terms for
-every matrix element would require O(M×K×N) intermediate storage, which is
-not practical.
+The DS decomposition of a matmul calls the f32 GEMM library four times
+(`hi·hi`, `hi·lo`, `lo·hi`, `lo·lo`). The library rounds every product and
+every partial sum to f32, and nothing captures that rounding, so the result
+is f32-accurate even though the inputs are carried exactly. Measured on H100
+and L40S at 2048²: 4.7e-7 to 8.1e-7 relative error at `precision=HIGHEST`,
+2.9e-4 at default precision (TF32), against ~1e-15 for native f64.
+
+So for f64 programs the pass calls a dedicated DS matmul kernel instead
+(`cpp/ds_gemm`): every multiply-add is done in DS with real FMA and the
+accumulators are kept as DS pairs, giving ~5e-14 relative error at 2048²
+and, standalone on an L40S, about 3× the speed of cuBLAS's native f64
+(`handoff.md` section 14). The proxy plugin loads it and registers it with
+XLA as the FFI target `ds_gemm`, so no user code is involved. It handles
+plain `A[M,K] @ B[K,N]`; for any other form, or if the kernel isn't
+registered, the pass leaves `dot_general` as a native f64 matmul:
+DS operands are recombined to f64, the matmul runs in f64, and its result is
+split back into a DS pair for the ops that follow. `DS_F32_MATMUL=1`
+restores the 4-GEMM version for f64 inputs (fast where f64 is weak, but
+f32-accurate). f32 matmuls always use the decomposition, which is no less
+accurate than the original f32 matmul. An f64-accurate *and* fast matmul
+would need a DS GEMM kernel with real FMA, or an Ozaki-style scheme on
+integer tensor cores; neither exists here yet.
 
 ---
 
@@ -656,7 +673,7 @@ not practical.
 | Element-wise `add` / `sub` / `mul` / `divide` / `sqrt` / `exp` / `log` inside `jax.jit` (f64) | ✅ Working |
 | `negate`, `abs`, comparisons, `select` / `jnp.where`, `maximum` / `minimum` (f64) | ✅ Working |
 | `jnp.sum`, `jnp.mean` (reduce with single add/sub/mul body, f64) | ✅ Working |
-| `jnp.matmul` / `@` (f64 inputs → 4 f32 GEMMs) | ✅ Working |
+| `jnp.matmul` / `@` (f64 inputs) | ✅ Native f64 by default (f64-accurate, f64 speed); `DS_F32_MATMUL=1` → 4 f32 GEMMs (fast, f32-accurate) |
 | Arithmetic with scalar f64 constants | ✅ Working |
 | **f32 inputs (precision improvement mode)** | |
 | Element-wise `add` / `sub` / `mul` / `divide` / `sqrt` / `exp` / `log` inside `jax.jit` (f32) | ✅ Working |

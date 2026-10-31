@@ -170,14 +170,18 @@ def run_structural_tests():
         # registration crash (see handoff.md §Important Caveats).
         return str(jax.jit(fn).lower(*args).compiler_ir())
 
-    def run_pass(mlir_text, tmp="/tmp/_ds_f64_test.mlir"):
+    def run_pass(mlir_text, tmp="/tmp/_ds_f64_test.mlir", extra_env=None):
         with open(tmp, "w") as f:
             f.write(mlir_text)
+        env = dict(os.environ)
+        env.pop("DS_F32_MATMUL", None)
+        env.pop("DS_GEMM_KERNEL_AVAILABLE", None)   # set by the plugin if JAX loaded it
+        env.update(extra_env or {})
         return subprocess.run(
             [str(OPT_BINARY),
              "--pass-pipeline=builtin.module(inline,func.func(ds-transform))",
              tmp],
-            capture_output=True, text=True, cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True, cwd=str(PROJECT_ROOT), env=env,
         )
 
     a64 = jax.ShapeDtypeStruct((16,), jnp.float64)
@@ -219,24 +223,67 @@ def run_structural_tests():
           n_red == 1,
           "reduce handler should emit exactly one 4-arg DS reduce")
 
-    # ── 2c. f64 matmul → 4 f32 sub-matmuls ──────────────────────────────────
+    # ── 2c. f64 matmul: native f64 by default; 4 f32 GEMMs if opted in ─────
+    # The 4-GEMM decomposition is only f32-accurate (each sub-GEMM rounds its
+    # products and partial sums to f32), so f64 matmuls stay native f64
+    # unless DS_F32_MATMUL=1 asks for the fast, f32-accurate version.
     A64 = jax.ShapeDtypeStruct((32, 32), jnp.float64)
 
     def fn_matmul(A, B):
         return A @ B
 
-    r3 = run_pass(lower_to_mlir(fn_matmul, A64, A64))
+    # (A*A) @ B: the matmul's operand is DS-computed, so the fallback has to
+    # recombine it to f64 rather than reuse the original f64 multiply.
+    def fn_mul_matmul(A, B):
+        return (A * A) @ B
+
+    mm_in = lower_to_mlir(fn_matmul, A64, A64)
+    r3 = run_pass(mm_in)
     check("f64 matmul: pass exits cleanly",
           r3.returncode == 0,
           r3.stderr[:400] if r3.returncode != 0 else "")
+    f64_dots = re.findall(r"stablehlo\.dot_general.*tensor<32x32xf64>", r3.stdout)
     n_dot = r3.stdout.count("stablehlo.dot_general")
-    check(f"f64 matmul → 4 DS sub-matmuls (got {n_dot})",
-          n_dot == 4,
-          "dot_general handler: 4-matmul DS decomposition")
-    n_conv3 = r3.stdout.count("stablehlo.convert")
-    check(f"f64 matmul → DS: convert ops present (got {n_conv3}, expected ≥ 4)",
-          n_conv3 >= 4,
-          "expected f64↔f32 ConvertOps at entry/exit")
+    check(f"f64 matmul (default) → 1 native f64 dot_general (got {n_dot}, f64-typed {len(f64_dots)})",
+          n_dot == 1 and len(f64_dots) == 1,
+          "default: f64 matmuls must stay native f64")
+
+    r3b = run_pass(lower_to_mlir(fn_mul_matmul, A64, A64))
+    n_mul64 = len(re.findall(r"stablehlo\.multiply.*tensor<32x32xf64>", r3b.stdout))
+    n_dot_b = r3b.stdout.count("stablehlo.dot_general")
+    check(f"f64 (A*A)@B (default) → DS multiply feeds 1 native f64 dot "
+          f"(dots {n_dot_b}, f64 multiplies left {n_mul64})",
+          r3b.returncode == 0 and n_dot_b == 1 and n_mul64 == 0,
+          "the original f64 multiply should be replaced by DS, recombined into the f64 dot")
+
+    kernel_env = {"DS_GEMM_KERNEL_AVAILABLE": "1"}
+    r5 = run_pass(mm_in, extra_env=kernel_env)
+    n_cc = len(re.findall(r"stablehlo\.custom_call @ds_gemm|call_target_name = \"ds_gemm\"", r5.stdout))
+    n_dot5 = r5.stdout.count("stablehlo.dot_general")
+    check(f"f64 matmul with the DS kernel registered → 1 custom_call @ds_gemm, no dot_general "
+          f"(calls {n_cc}, dots {n_dot5})",
+          r5.returncode == 0 and n_cc == 1 and n_dot5 == 0,
+          r5.stderr[:400] if r5.returncode != 0 else "expected the matmul to become the DS kernel call")
+
+    r6 = run_pass(lower_to_mlir(fn_mul_matmul, A64, A64), extra_env=kernel_env)
+    n_cc6 = len(re.findall(r"stablehlo\.custom_call @ds_gemm|call_target_name = \"ds_gemm\"", r6.stdout))
+    check(f"f64 (A*A)@B with the DS kernel → DS multiply feeds the kernel call (calls {n_cc6})",
+          r6.returncode == 0 and n_cc6 == 1 and "stablehlo.dot_general" not in r6.stdout,
+          r6.stderr[:400] if r6.returncode != 0 else "")
+
+    def fn_batched(A, B):
+        return jnp.einsum("bij,bjk->bik", A, B)
+    Ab = jax.ShapeDtypeStruct((2, 16, 16), jnp.float64)
+    r7 = run_pass(lower_to_mlir(fn_batched, Ab, Ab), extra_env=kernel_env)
+    check("batched f64 matmul with the DS kernel → falls back to native f64 (no kernel call)",
+          r7.returncode == 0 and "ds_gemm" not in r7.stdout and "stablehlo.dot_general" in r7.stdout,
+          r7.stderr[:400] if r7.returncode != 0 else "the kernel only handles plain A[M,K]@B[K,N]")
+
+    r4 = run_pass(mm_in, extra_env={"DS_F32_MATMUL": "1"})
+    n_dot4 = r4.stdout.count("stablehlo.dot_general")
+    check(f"f64 matmul with DS_F32_MATMUL=1 → 4 f32 sub-matmuls (got {n_dot4})",
+          r4.returncode == 0 and n_dot4 == 4,
+          "opt-in: 4-matmul DS decomposition")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -314,7 +361,30 @@ def run_gpu_tests():
           ds_err <= f32_err + 1e-6,
           f"DS={ds_val:.8f}, f32={f32_val:.8f}, f64={f64_val:.8f}")
 
-    # ── 3c. NaN propagation ───────────────────────────────────────────────────
+    # ── 3c. f64 matmul stays f64-accurate through the plugin ─────────────────
+    rng = np.random.default_rng(3)
+    A_np = rng.standard_normal((256, 256))
+    B_np = rng.standard_normal((256, 256))
+
+    @jax.jit
+    def mm_fn(A, B):
+        return (A * A) @ B
+
+    got = np.array(block(mm_fn(jnp.array(A_np), jnp.array(B_np))))
+    truth = (A_np * A_np) @ B_np
+    rel = float(np.linalg.norm(got - truth) / np.linalg.norm(truth))
+    # The plugin sets this with setenv() after Python started, so os.environ
+    # (a snapshot) can't see it; read the process environment directly.
+    import ctypes
+    libc = ctypes.CDLL(None)
+    libc.getenv.restype = ctypes.c_char_p
+    path = ("DS kernel" if libc.getenv(b"DS_GEMM_KERNEL_AVAILABLE") == b"1"
+            else "native f64 fallback")
+    check(f"f64 (A*A)@B through plugin [{path}]: f64-accurate (rel err {rel:.2e} < 1e-12)",
+          rel < 1e-12,
+          "a value near 1e-7 or 3e-4 means the f32-accurate decomposition ran")
+
+    # ── 3d. NaN propagation ───────────────────────────────────────────────────
     a_nan = jnp.array([1.0, float('nan'), 3.0], dtype=jnp.float64)
     b_nan = jnp.array([1.0, 2.0,         3.0], dtype=jnp.float64)
 

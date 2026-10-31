@@ -25,6 +25,9 @@
 //                         ported from double_binary32_compare)
 //   stablehlo.select    → applies the same predicate to both components
 //   stablehlo.maximum/minimum → built from ds_compare + select
+//   stablehlo.dot_general (f64, A[M,K]@B[K,N]) → custom_call @ds_gemm, the
+//                         DS matmul kernel in cpp/ds_gemm, when the plugin
+//                         has registered it; otherwise native f64
 //   func entry args     → split into (hi, lo) via emitFromFloat
 //   func return values  → recombined via emitToFloat
 //
@@ -77,6 +80,7 @@ struct PassPluginLibraryInfo {
 #include "mlir/Support/LLVM.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -855,6 +859,22 @@ static std::pair<Value, Value> emitDsLog(OpBuilder& bld, Location loc,
     return {sel(isSpecial, specialHi, resh), sel(isSpecial, specialLo, resl)};
 }
 
+// True for the plain matrix product A[M,K] @ B[K,N] with static shapes: rank-2
+// operands, no batch dimensions, contracting lhs dim 1 with rhs dim 0. That is
+// the only form the DS matmul kernel (cpp/ds_gemm) handles.
+static bool isPlainMatmul(stablehlo::DotGeneralOp dot) {
+    auto lt = dyn_cast<RankedTensorType>(dot.getLhs().getType());
+    auto rt = dyn_cast<RankedTensorType>(dot.getRhs().getType());
+    if (!lt || !rt || lt.getRank() != 2 || rt.getRank() != 2) return false;
+    if (!lt.hasStaticShape() || !rt.hasStaticShape()) return false;
+    auto dn = dot.getDotDimensionNumbers();
+    if (!dn.getLhsBatchingDimensions().empty() || !dn.getRhsBatchingDimensions().empty())
+        return false;
+    auto lc = dn.getLhsContractingDimensions();
+    auto rc = dn.getRhsContractingDimensions();
+    return lc.size() == 1 && lc[0] == 1 && rc.size() == 1 && rc[0] == 0;
+}
+
 // Split an f32/f64 tensor into a DS (hi, lo) pair.
 //   For f64: hi = float(v),  lo = float(v - double(hi))
 //   For f32: hi = v,         lo = 0  (already exact)
@@ -940,6 +960,23 @@ struct DsTransformPass
     // check at the end of processOps()'s op loop. Same getenv-based
     // mechanism as returnPairs above, for the same reason.
     bool warnUnsupported = false;
+
+    // DS_F32_MATMUL=1 (opt-in, off by default): restore the old behaviour of
+    // rewriting f64 matmuls into the 4-GEMM DS decomposition. Off, f64
+    // matmuls run as native f64 -- see the dot_general handler for why.
+    bool f32AccurateF64Matmul = false;
+
+    // DS_GEMM_KERNEL_AVAILABLE=1 is set by the proxy plugin once it has
+    // registered the DS matmul kernel (cpp/ds_gemm) as the FFI target
+    // "ds_gemm". Only then may the pass emit calls to it; otherwise f64
+    // matmuls fall back to native f64.
+    bool dsGemmKernel = false;
+
+    // Values computed natively in f64 (matmuls kept as native f64) whose DS
+    // pair is only a split of that native value. Returned as-is at
+    // func.return, like function arguments, so splitting and recombining
+    // doesn't round them to DS precision.
+    llvm::DenseSet<Value> nativeValues;
 
     // ── Entry: split function arguments into DS pairs ─────────────────────
     void convertFuncArgs(func::FuncOp func) {
@@ -1240,13 +1277,77 @@ struct DsTransformPass
             //   corr = e1 + e2 + e3
             //   (out_hi, out_lo) = two_sum(p, corr)
             //
-            // Precision note: each sub-dot accumulates in f32 (no two_prod per
-            // element), but lo-channel cross terms are fully accounted for.
-            // XLA sees 4 dot_generals it can dispatch to cuBLAS independently.
+            // Precision note: each sub-dot is an f32 library GEMM that rounds
+            // every product and partial sum to f32, and nothing captures that
+            // rounding; the lo cross terms only carry the inputs' lo words.
+            // So the result is f32-accurate, not DS-accurate (measured on
+            // H100 and L40S: relative error 4.7e-7 to 8.1e-7 at
+            // precision=HIGHEST, 2.9e-4 at default precision, vs ~1e-15 for
+            // native f64 -- tests/diag_f64_matmul.py).
+            //
+            // f64 matmuls therefore run as NATIVE f64 by default: each DS
+            // operand is recombined to f64, the original dot_general is kept
+            // unchanged, and its f64 result is split back into a DS pair for
+            // downstream ops. That keeps f64 programs f64-accurate, at native
+            // f64 matmul speed. DS_F32_MATMUL=1 restores the 4-GEMM
+            // decomposition for f64 inputs (fast on GPUs with weak f64, but
+            // f32-accurate). f32 matmuls always use the decomposition: for
+            // them it is no less accurate than the original f32 matmul.
             if (auto dotOp = dyn_cast<stablehlo::DotGeneralOp>(op)) {
                 if (!isFloatTensor(dotOp.getResult())) continue;
                 if (!dsMap.count(dotOp.getLhs()) ||
                     !dsMap.count(dotOp.getRhs())) continue;
+
+                bool f64Result = cast<RankedTensorType>(dotOp.getResult().getType())
+                                     .getElementType().isF64();
+
+                // f64 matmul of the plain form A[M,K] @ B[K,N], with the DS
+                // kernel available: call it. It keeps the result as a DS
+                // pair (f64-class accuracy, ~5e-14 at 2048^2), so the ops
+                // that follow use it directly. Batched or transposed forms
+                // fall through to native f64 below.
+                if (f64Result && !f32AccurateF64Matmul && dsGemmKernel &&
+                    isPlainMatmul(dotOp)) {
+                    auto [a_hi, a_lo] = dsMap[dotOp.getLhs()];
+                    auto [b_hi, b_lo] = dsMap[dotOp.getRhs()];
+                    auto cTy = toF32Type(
+                        cast<RankedTensorType>(dotOp.getResult().getType()));
+                    MLIRContext* ctx = op->getContext();
+                    auto rowMajor = DenseIntElementsAttr::get(
+                        RankedTensorType::get({2}, IndexType::get(ctx)),
+                        ArrayRef<int64_t>{1, 0});
+                    SmallVector<Attribute> inLayouts(4, rowMajor);
+                    SmallVector<Attribute> outLayouts(2, rowMajor);
+                    SmallVector<NamedAttribute> attrs = {
+                        b.getNamedAttr("call_target_name", b.getStringAttr("ds_gemm")),
+                        b.getNamedAttr("api_version",
+                            stablehlo::CustomCallApiVersionAttr::get(
+                                ctx, stablehlo::CustomCallApiVersion::API_VERSION_TYPED_FFI)),
+                        b.getNamedAttr("backend_config", b.getDictionaryAttr({})),
+                        b.getNamedAttr("operand_layouts", b.getArrayAttr(inLayouts)),
+                        b.getNamedAttr("result_layouts", b.getArrayAttr(outLayouts)),
+                    };
+                    auto call = b.create<stablehlo::CustomCallOp>(
+                        loc, TypeRange{cTy, cTy},
+                        ValueRange{a_hi, a_lo, b_hi, b_lo}, attrs);
+                    dsMap[dotOp.getResult()] = {call->getResult(0), call->getResult(1)};
+                    toErase.push_back(op);
+                    continue;
+                }
+
+                if (f64Result && !f32AccurateF64Matmul) {
+                    for (unsigned i = 0; i < 2; ++i) {
+                        Value orig = op->getOperand(i);
+                        auto [hi, lo] = dsMap[orig];
+                        op->setOperand(i, emitToFloat(b, loc, hi, lo, orig.getType()));
+                    }
+                    OpBuilder bPost(op->getContext());
+                    bPost.setInsertionPointAfter(op);
+                    dsMap[dotOp.getResult()] =
+                        emitFromFloat(bPost, loc, dotOp.getResult());
+                    nativeValues.insert(dotOp.getResult());
+                    continue;
+                }
 
                 auto [a_hi, a_lo] = dsMap[dotOp.getLhs()];
                 auto [b_hi, b_lo] = dsMap[dotOp.getRhs()];
@@ -1460,10 +1561,11 @@ struct DsTransformPass
                         }
                     }
                     if (!substitutedPair) {
-                        // A function argument returned untouched keeps its
-                        // original value: splitting and recombining it
-                        // would only round an f64 to DS precision.
-                        if (isa<BlockArgument>(orig)) continue;
+                        // A function argument, or a value computed natively
+                        // in f64, returned untouched keeps its original
+                        // value: splitting and recombining it would only
+                        // round an f64 to DS precision.
+                        if (isa<BlockArgument>(orig) || nativeValues.count(orig)) continue;
                         Value combined = emitToFloat(rb, loc, hi, lo, orig.getType());
                         operand.set(combined);
                     }
@@ -1506,10 +1608,15 @@ struct DsTransformPass
     void runOnOperation() override {
         func::FuncOp func = getOperation();
         dsMap.clear();
+        nativeValues.clear();
         const char* rp = std::getenv("DS_RETURN_PAIRS");
         returnPairs = rp && std::string(rp) == "1";
         const char* wu = std::getenv("DS_WARN_UNSUPPORTED");
         warnUnsupported = wu && std::string(wu) == "1";
+        const char* fm = std::getenv("DS_F32_MATMUL");
+        f32AccurateF64Matmul = fm && std::string(fm) == "1";
+        const char* gk = std::getenv("DS_GEMM_KERNEL_AVAILABLE");
+        dsGemmKernel = gk && std::string(gk) == "1";
         convertFuncArgs(func);
         processOps(func);
     }

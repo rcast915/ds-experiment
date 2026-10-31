@@ -15,6 +15,12 @@
 
 extern char** environ;
 #include "xla/pjrt/c/pjrt_c_api.h"
+// Vendored from XLA (pjrt_plugin/third_party/); the image only ships
+// pjrt_c_api.h. Older copies of pjrt_c_api.h lack PJRT_NO_DISCARD.
+#ifndef PJRT_NO_DISCARD
+#define PJRT_NO_DISCARD
+#endif
+#include "xla/pjrt/c/pjrt_c_api_ffi_extension.h"
 
 static const char* REAL_PLUGIN_PATH =
     "/usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12_disabled/xla_cuda_plugin.so";
@@ -22,6 +28,8 @@ static const char* DS_OPT_BINARY =
     "/src/ds_experiment/stablehlo_pass/build/mlir-ds-opt";
 static const char* DS_FFI_OPT_BINARY =
     "/src/ds_experiment/stablehlo_pass/build/mlir-ds-ffi-opt";
+static const char* DS_GEMM_FFI_LIB =
+    "/src/ds_experiment/cpp/ds_gemm/build/ffi/libds_gemm_ffi.so";
 
 static bool use_ffi_pass() { const char* m = getenv("DS_PASS_MODE"); return m && std::string(m)=="ffi"; }
 static bool bypass_pass()  { const char* b = getenv("DS_BYPASS");    return b && std::string(b)=="1"; }
@@ -202,6 +210,80 @@ static PJRT_Error* ds_compile_wrapper(PJRT_Client_Compile_Args* args) {
     return res;
 }
 
+// Register the DS matmul kernel (cpp/ds_gemm) with the real backend as the
+// FFI target "ds_gemm", through PJRT's FFI extension, so the pass can call it
+// for f64 matmuls without any user code. On success, sets
+// DS_GEMM_KERNEL_AVAILABLE=1 in this process's environment; mlir-ds-opt
+// inherits it (run_command passes `environ`) and only then emits the call.
+// DS_GEMM_KERNEL=0 skips registration (f64 matmuls then run as native f64).
+static void print_pjrt_error(const PJRT_Api* api, PJRT_Error* err, const char* what) {
+    PJRT_Error_Message_Args m;
+    memset(&m, 0, sizeof(m));
+    m.struct_size = PJRT_Error_Message_Args_STRUCT_SIZE;
+    m.error = err;
+    api->PJRT_Error_Message(&m);
+    fprintf(stderr, "[ds_pjrt] %s: %.*s\n", what, (int)m.message_size, m.message);
+    PJRT_Error_Destroy_Args d;
+    memset(&d, 0, sizeof(d));
+    d.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
+    d.error = err;
+    api->PJRT_Error_Destroy(&d);
+}
+
+static void register_ds_gemm(const PJRT_Api* api) {
+    const char* off = getenv("DS_GEMM_KERNEL");
+    if (off && std::string(off) == "0") {
+        fprintf(stderr, "[ds_pjrt] DS matmul kernel disabled (DS_GEMM_KERNEL=0)\n");
+        return;
+    }
+    const PJRT_FFI_Extension* ffi_ext = nullptr;
+    for (const PJRT_Extension_Base* e = api->extension_start; e; e = e->next) {
+        if (e->type == PJRT_Extension_Type_FFI) {
+            ffi_ext = reinterpret_cast<const PJRT_FFI_Extension*>(e);
+            break;
+        }
+    }
+    if (!ffi_ext) {
+        fprintf(stderr, "[ds_pjrt] DS matmul kernel not registered: backend has no PJRT FFI extension\n");
+        return;
+    }
+    if (ffi_ext->base.struct_size < PJRT_FFI_Extension_STRUCT_SIZE || !ffi_ext->register_handler) {
+        fprintf(stderr, "[ds_pjrt] DS matmul kernel not registered: backend's FFI extension "
+                        "has no register_handler (struct_size %zu)\n", ffi_ext->base.struct_size);
+        return;
+    }
+    void* lib = dlopen(DS_GEMM_FFI_LIB, RTLD_NOW | RTLD_LOCAL);
+    if (!lib) {
+        fprintf(stderr, "[ds_pjrt] DS matmul kernel not registered: %s\n", dlerror());
+        return;
+    }
+    void* handler = dlsym(lib, "DsGemm");
+    if (!handler) {
+        fprintf(stderr, "[ds_pjrt] DS matmul kernel not registered: no DsGemm symbol\n");
+        return;
+    }
+    static const char* target = "ds_gemm";
+    for (const char* platform : {"CUDA", "cuda", "gpu"}) {
+        PJRT_FFI_Register_Handler_Args args;
+        memset(&args, 0, sizeof(args));
+        args.struct_size = PJRT_FFI_Register_Handler_Args_STRUCT_SIZE;
+        args.target_name = target;
+        args.target_name_size = strlen(target);
+        args.handler = handler;
+        args.platform_name = platform;
+        args.platform_name_size = strlen(platform);
+        args.traits = static_cast<PJRT_FFI_Handler_TraitsBits>(0);
+        PJRT_Error* err = ffi_ext->register_handler(&args);
+        if (!err) {
+            setenv("DS_GEMM_KERNEL_AVAILABLE", "1", 1);
+            fprintf(stderr, "[ds_pjrt] DS matmul kernel registered (target ds_gemm, platform %s)\n",
+                    platform);
+            return;
+        }
+        print_pjrt_error(api, err, "register_handler failed");
+    }
+}
+
 // Boilerplate PJRT Proxy Initialization
 extern "C" const PJRT_Api* GetPjrtApi() {
     if (!initialized) {
@@ -223,6 +305,8 @@ extern "C" const PJRT_Api* GetPjrtApi() {
 
         real_compile_fn = ds_api.PJRT_Client_Compile;
         ds_api.PJRT_Client_Compile = ds_compile_wrapper;
+
+        if (!bypass_pass()) register_ds_gemm(real_api);
 
         initialized = true;
         fprintf(stderr, "[ds_pjrt] Proxy initialized\n");

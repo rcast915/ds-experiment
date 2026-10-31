@@ -25,6 +25,13 @@ echo "[ds_setup] Step 2: build PJRT plugin"
 cmake -GNinja -S pjrt_plugin -B pjrt_plugin/build > /dev/null
 ninja -C pjrt_plugin/build
 
+echo "[ds_setup] Step 2b: build DS matmul kernel library (cpp/ds_gemm)"
+if cmake -GNinja -S cpp/ds_gemm -B cpp/ds_gemm/build/ffi > /dev/null && ninja -C cpp/ds_gemm/build/ffi; then
+    echo "  OK: cpp/ds_gemm/build/ffi/libds_gemm_ffi.so"
+else
+    echo "  WARNING: build failed; f64 matmuls will run as native f64"
+fi
+
 echo "[ds_setup] Step 3: verify"
 out=$(DS_BYPASS=1 \
   PJRT_NAMES_AND_LIBRARY_PATHS="cuda:/src/ds_experiment/pjrt_plugin/build/libds_pjrt_plugin.so" \

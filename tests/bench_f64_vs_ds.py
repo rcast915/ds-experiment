@@ -114,6 +114,12 @@ def run_bench(n: int, mode: str, bypass: bool) -> dict:
         env["DS_BYPASS"] = "1"
     else:
         env.pop("DS_BYPASS", None)
+    # f64 matmuls stay native f64 by default (the 4-GEMM decomposition is only
+    # f32-accurate); time the decomposition explicitly so the table shows it.
+    if mode == "matmul" and not bypass:
+        env["DS_F32_MATMUL"] = "1"
+    else:
+        env.pop("DS_F32_MATMUL", None)
 
     result = subprocess.run(
         [sys.executable, "-c", _BENCH_CODE,
@@ -197,7 +203,7 @@ def run_vec_suite(mode: str, label: str, sizes: list, flops_fn) -> list:
 
 
 def run_mat_suite(sizes: list) -> list:
-    print_header_mat("A @ B  (f64 vs DS-f32 — main speedup result)")
+    print_header_mat("A @ B  (f64 vs DS 4-GEMM, DS_F32_MATMUL=1 — f32-ACCURATE, not like-for-like)")
     results = []
     for n in sizes:
         f64_data = run_bench(n, "matmul", bypass=True)
@@ -251,7 +257,10 @@ if __name__ == "__main__":
     print()
     print("Notes:")
     print("  speedup > 1 means DS-f32 is faster than native f64.")
-    print("  Matmul: on GPUs without native FP64 tensor cores (e.g. L40S),")
+    print("  Matmul: the DS column is the opt-in 4-GEMM decomposition (DS_F32_MATMUL=1),")
+    print("    which is only f32-accurate (see tests/diag_f64_matmul.py); by default the")
+    print("    pass keeps f64 matmuls native. Timing only, not an accuracy-matched result.")
+    print("  On GPUs without native FP64 tensor cores (e.g. L40S),")
     print("    f64 GEMM runs at ~1/64 f32 throughput. DS uses 4 f32 GEMMs,")
     print("    so expected speedup ≈ 7–16× over native f64.")
     print("  TFLOPS denominator = 2·N³ (standard matmul). DS runs 4 sub-")

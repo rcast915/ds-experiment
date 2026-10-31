@@ -29,7 +29,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
-#include "ds_gemm_math.h"
+#include "ds_gemm_kernel.cuh"
 
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); \
@@ -37,102 +37,6 @@
 #define CUBLAS_CHECK(x) do { cublasStatus_t s_ = (x); if (s_ != CUBLAS_STATUS_SUCCESS) { \
     fprintf(stderr, "cuBLAS error %d at %s:%d\n", (int)s_, __FILE__, __LINE__); \
     exit(1); } } while (0)
-
-constexpr int BM = 64, BN = 64, BK = 8;   // block tile
-constexpr int TM = 4,  TN = 4;            // outputs per thread
-constexpr int THREADS = (BM / TM) * (BN / TN);   // 256
-
-// f64 -> (hi, lo) f32 pair, elementwise.
-__global__ void split_kernel(const double* __restrict__ x, float* __restrict__ hi,
-                             float* __restrict__ lo, size_t n) {
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i < n) {
-        double v = x[i];
-        float h = __double2float_rn(v);
-        hi[i] = h;
-        lo[i] = __double2float_rn(v - (double)h);
-    }
-}
-
-// C (M x N, row-major, f64) = A (M x K) * B (K x N), A and B given as (hi, lo)
-// f32 arrays, row-major.
-__global__ void __launch_bounds__(THREADS)
-ds_gemm_kernel(int M, int N, int K,
-               const float* __restrict__ Ah, const float* __restrict__ Al,
-               const float* __restrict__ Bh, const float* __restrict__ Bl,
-               double* __restrict__ C) {
-    // A tile stored transposed (k-major) so a thread's TM rows are contiguous.
-    __shared__ float sAh[BK][BM], sAl[BK][BM];
-    __shared__ float sBh[BK][BN], sBl[BK][BN];
-
-    const int tid = threadIdx.x;
-    const int tx  = tid % (BN / TN);   // 0..15, along N
-    const int ty  = tid / (BN / TN);   // 0..15, along M
-    const int row0 = blockIdx.y * BM;
-    const int col0 = blockIdx.x * BN;
-
-    float acc_h[TM][TN], acc_l[TM][TN];
-    #pragma unroll
-    for (int i = 0; i < TM; ++i)
-        #pragma unroll
-        for (int j = 0; j < TN; ++j) { acc_h[i][j] = 0.f; acc_l[i][j] = 0.f; }
-
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        // Load the A tile (BM x BK) and B tile (BK x BN): 512 elements each,
-        // two per thread, zero-filled outside the matrix.
-        #pragma unroll
-        for (int r = 0; r < (BM * BK) / THREADS; ++r) {
-            int idx = tid + r * THREADS;          // 0..511
-            int am = idx / BK, ak = idx % BK;     // A: row within tile, k within tile
-            int gr = row0 + am, gk = k0 + ak;
-            bool ok = (gr < M) && (gk < K);
-            size_t g = (size_t)gr * K + gk;
-            sAh[ak][am] = ok ? Ah[g] : 0.f;
-            sAl[ak][am] = ok ? Al[g] : 0.f;
-
-            int bk = idx / BN, bn = idx % BN;     // B: k within tile, col within tile
-            int gk2 = k0 + bk, gc = col0 + bn;
-            bool ok2 = (gk2 < K) && (gc < N);
-            size_t g2 = (size_t)gk2 * N + gc;
-            sBh[bk][bn] = ok2 ? Bh[g2] : 0.f;
-            sBl[bk][bn] = ok2 ? Bl[g2] : 0.f;
-        }
-        __syncthreads();
-
-        #pragma unroll
-        for (int k = 0; k < BK; ++k) {
-            float ah[TM], al[TM], bh[TN], bl[TN];
-            #pragma unroll
-            for (int i = 0; i < TM; ++i) { ah[i] = sAh[k][ty * TM + i]; al[i] = sAl[k][ty * TM + i]; }
-            #pragma unroll
-            for (int j = 0; j < TN; ++j) { bh[j] = sBh[k][tx * TN + j]; bl[j] = sBl[k][tx * TN + j]; }
-            #pragma unroll
-            for (int i = 0; i < TM; ++i)
-                #pragma unroll
-                for (int j = 0; j < TN; ++j)
-                    ds_mac(acc_h[i][j], acc_l[i][j], ah[i], al[i], bh[j], bl[j]);
-        }
-
-        // Keep the low word small: renormalize once per depth-8 tile.
-        #pragma unroll
-        for (int i = 0; i < TM; ++i)
-            #pragma unroll
-            for (int j = 0; j < TN; ++j)
-                ds_finish(acc_h[i][j], acc_l[i][j]);
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        int r = row0 + ty * TM + i;
-        if (r >= M) continue;
-        #pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            int c = col0 + tx * TN + j;
-            if (c < N) C[(size_t)r * N + c] = (double)acc_h[i][j] + (double)acc_l[i][j];
-        }
-    }
-}
 
 // Median over `reps` timed calls of f(), after `warmup` untimed calls.
 template <class F>
@@ -229,9 +133,8 @@ int main(int argc, char** argv) {
             split_kernel<<<sblocks, sthreads>>>(dA, dAh, dAl, nn);
             split_kernel<<<sblocks, sthreads>>>(dB, dBh, dBl, nn);
         };
-        dim3 grid((n + BN - 1) / BN, (n + BM - 1) / BM);
         auto dsgemm = [&] {
-            ds_gemm_kernel<<<grid, THREADS>>>(n, n, n, dAh, dAl, dBh, dBl, dCds);
+            ds_gemm_launch(n, n, n, dAh, dAl, dBh, dBl, dCds, nullptr, nullptr);
         };
 
         double t_d = time_ms(dgemm);
