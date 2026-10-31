@@ -12,3 +12,6 @@ logs/error/
 # Container image and sandbox kept in the repo dir on orthus
 *.sif
 ds-sandbox/
+
+# Build outputs of the standalone DS matmul benchmark
+cpp/ds_gemm/build/
