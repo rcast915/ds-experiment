@@ -483,7 +483,7 @@ Matmul through JAX (DS = kernel; errors match the kernel, so it registered):
 | 1024 | 2.067 | 1.679 | 1.23× | 3.8e-14 | 2.147 |
 | 2048 | 11.040 | 3.986 | **2.77×** | 5.4e-14 | 11.081 |
 
-DS kernel at 2048² is only ~10% faster than on L40S (3.99 vs 4.42 ms) despite more f32 throughput: the untuned kernel, not the hardware, sets its speed.
+(Superseded: an earlier note here said the kernel was barely faster than on L40S. That came from the through-JAX 2048² time, inflated by this node's ~0.7 ms per-call overhead; the standalone numbers below show the kernel is clearly faster on Blackwell.)
 
 **Repeats (same day; full suite ×3 more, purification ×3, FMA bound ×1).** Per-call overhead measured directly: trivial `x + 1` through the plugin with DS_BYPASS=1 = 0.698 ms median / 0.102 min / 0.838 p90 over 200 calls, so sizes ≤1M options and 256²–1024² matmul measure overhead.
 
@@ -497,6 +497,22 @@ DS kernel at 2048² is only ~10% faster than on L40S (3.99 vs 4.42 ms) despite m
 | Matmul 2048² (4 runs) | 10.70–11.04 ms | 3.32–3.99 ms | 2.77–3.23×, median 2.86× |
 
 Purification errors identical to L40S/H100 (DS ‖P−Pexact‖ 3.9e-13 at 4096; f32 7.1e-4, up to 7.6e-3 electrons lost). FMA bound: 64M DS/DS+FMA* 0.97× (no gain, as on L40S); 16M 1.23× but DS+FMA* spread ±19%; 1M spreads ±49–112%, unusable. Run 1606's plain-f32 matmul column printed "-" (subprocess failure, not investigated).
+
+### 18. f64 GEMM baselines and the Blackwell FP64 rate (Stravinsky, 2026-11-13, `tests/run_gemm_baseline.sh`)
+
+**Driver-reported (cudaDevAttrSingleToDoublePrecisionPerfRatio): FP32:FP64 = 64:1.** CC 12.0, 188 SMs, 2430 MHz max → FP32 peak 188×128×2×2.43 GHz ≈ 117 TFLOPS (datasheet: 120; the datasheet gives no FP64 figure), FP64 peak ≈ 1.83 TFLOPS. Measured XLA f64 matmul 1.72 TFLOP/s at 4096² = 94% of that CUDA-core FP64 peak, so no FP64 tensor cores (H100: ~46 TFLOP/s at 2048²).
+
+**Why XLA's f64 matmul beats cuBLAS DGEMM:** XLA does not call cuBLAS for f64 dot at all. It emits a Triton GEMM fusion (`__triton_nested_gemm_fusion`, kernel `gemm_fusion_dot_general_1`) and autotunes its tiling (1024²: block 16×8×16, 2 stages, 2 warps). `--xla_gpu_enable_cublaslt=true/false` changes nothing (same Triton path). Same node, ms:
+
+| n | cuBLAS DGEMM | XLA f64 default | Lt on | Lt off | SGEMM | DS kernel + split | DGEMM/DS | XLA/DS |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 1.581 | 1.405 | 1.607 | 1.459 | 0.057 | 0.535 | 2.96× | 2.6× |
+| 2048 | 11.405 | 10.408 | 10.176 | 10.352 | 0.295 | 2.947 | 3.87× | 3.5× |
+| 4096 | 90.022 | 79.806 | 79.713 | 79.907 | 1.849 | 22.211 | 4.05× | 3.6× |
+
+XLA is 10–13% faster than cuBLAS DGEMM here, the same direction as on L40S (12.6 vs 15.2 ms at 2048², different jobs/nodes; L40S same-node run still to do). All headline DS speedups (purification, through-JAX matmul) are against the XLA baseline, the faster one; the standalone table is against cuBLAS DGEMM and must say so. DS kernel on Blackwell: 6.3 TFLOP/s-equivalent at 4096² vs ~3.9 on L40S. Measured SGEMM 74 TFLOP/s → measured SGEMM:XLA-f64 ≈ 43:1 at 4096².
+
+Kernel tiling: fixed BM=BN=64, BK=8, 4×4 per thread, 256 threads (`ds_gemm_kernel.cuh:17-19`), no per-architecture variants; not tuned for any GPU.
 
 ### 6. Test Suite — Working ✅
 Confirmed 2026-06-19. Run from inside the container:

@@ -24,6 +24,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
 gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+[[ -z "$gpu" ]] && gpu="$(grep -h -m1 '^Model:' /proc/driver/nvidia/gpus/*/information 2>/dev/null \
+                          | head -1 | sed 's/^Model:[[:space:]]*//')"
 gpu="$(echo "${gpu:-unknown-gpu}" | tr -c 'A-Za-z0-9\n' '-')"
 label="${1:-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p results cpp/ds_gemm/build
@@ -85,7 +87,17 @@ for n in (1024, 2048, 4096):
     ms = float(np.median(ts)) * 1e3
     print(f"  n={n:5d}  f64 matmul {ms:9.3f} ms   {2*n**3/ms/1e9:7.3f} TFLOP/s   (dtype {a.dtype})")
 EOF
-        echo "  GEMM routine XLA chose: $(grep -ho 'custom_call_target="[^"]*"' "$dump"/*after_optimizations.txt 2>/dev/null | sort | uniq -c | tr '\n' ' ')"
+        # What XLA runs for each matmul: the executed kernel (thunk sequence)
+        # and, if autotuned, the chosen Triton tiling or cuBLAS algorithm.
+        for m in "$dump"/*jit__lambda.thunk_sequence.txt; do
+            [[ -f "$m" ]] || continue
+            base="${m%.thunk_sequence.txt}"
+            shape="$(grep -o 'f64\[[0-9]*,[0-9]*\]' "$base".sm_*after_optimizations.txt 2>/dev/null | head -1)"
+            kern="$(grep -o 'kernel=[^,]*\|kGemm[^ ]*\|kCublas[^ ]*' "$m" | tr '\n' ' ')"
+            tune="$(tr -d ' ' < "$base".autotune_results.pbtxt 2>/dev/null \
+                    | grep -o -e '^triton' -e '^gemm' -e 'block_[mnk]:[0-9]*' -e 'num_stages:[0-9]*' -e 'num_warps:[0-9]*' -e 'algorithm:[0-9-]*' | tr '\n' ' ')"
+            echo "  XLA ran for ${shape:-?}: ${kern:-?}  autotune: ${tune:-none}"
+        done
     done
 } 2>&1 | tee "$OUT"
 rc=${PIPESTATUS[0]}
