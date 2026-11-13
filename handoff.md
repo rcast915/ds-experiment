@@ -467,7 +467,36 @@ DS is now genuinely DS (errors ~1e-13, distinct from f64) and f64-class; native 
 | 4096 | DS native | 4925.4 | 0.99× | 7.0e-14 | 6.3e-14 | 4.8e-11 | 1.1e-14 |
 | 4096 | f32 | 78.7 | 62.0× | 7.1e-4 | 1.7e-4 | 3.0e-3 | 6.6e-5 |
 
-Headline for the paper: an unmodified JAX purification code runs **2.7–3.0× faster than native f64 on the L40S at f64-class accuracy** (‖P−Pexact‖ ~1e-13 vs 7e-4 for f32; electron count kept to ≤1e-10 vs up to 6e-3 lost by f32). DS errors are bit-identical between H100 and L40S at n=4096 (deterministic kernel). DS elementwise overhead is negligible: "DS native" ≈ f64. Single run; repeat on a quiet node before freezing numbers.
+Headline for the paper: an unmodified JAX purification code runs **2.7–3.0× faster than native f64 on the L40S at f64-class accuracy** (‖P−Pexact‖ ~1e-13 vs 7e-4 for f32; electron count kept to ≤1e-10 vs up to 6e-3 lost by f32). DS errors are bit-identical between H100 and L40S at n=4096 (deterministic kernel). DS elementwise overhead is negligible: "DS native" ≈ f64. Repeated by the user (2026-10-31, several L40S runs): same results, so the timings are stable.
+
+### 17. Third GPU: RTX PRO 6000 Blackwell (UO NIC Stravinsky, 2026-11-13)
+
+Stravinsky is not a Slurm partition; run directly over ssh with `nohup bash submit_blackwell.sh` (script now works with or without Slurm; `-p godzilla` etc. under Slurm). Kernel build now lists sm_75/80/86/89/90/120 (PTX only JITs forward, so the T4 needed its own entry). Run label `stravinsky-1113-1537`. Node has a ~0.5–0.9 ms per-call floor (f32 Black-Scholes 0.55 ms at 1M), so only rows well above it count.
+
+Black-Scholes: 1M 1.372 / 0.547 ms (2.51×, floor-affected), **16M 5.034 / 3.089 ms (1.63×)**; errors identical to H100/L40S (DS 3.6e-10 at 16M, f32 9.8e-3).
+
+Matmul through JAX (DS = kernel; errors match the kernel, so it registered):
+
+| n | f64 ms | DS ms | speedup | DS err | DS native ms |
+|---|---|---|---|---|---|
+| 256 | 0.528 | 0.737 | 0.72× | 1.9e-14 | 0.286 |
+| 1024 | 2.067 | 1.679 | 1.23× | 3.8e-14 | 2.147 |
+| 2048 | 11.040 | 3.986 | **2.77×** | 5.4e-14 | 11.081 |
+
+DS kernel at 2048² is only ~10% faster than on L40S (3.99 vs 4.42 ms) despite more f32 throughput: the untuned kernel, not the hardware, sets its speed.
+
+**Repeats (same day; full suite ×3 more, purification ×3, FMA bound ×1).** Per-call overhead measured directly: trivial `x + 1` through the plugin with DS_BYPASS=1 = 0.698 ms median / 0.102 min / 0.838 p90 over 200 calls, so sizes ≤1M options and 256²–1024² matmul measure overhead.
+
+| Benchmark | f64 | DS | DS speedup |
+|---|---|---|---|
+| Purification n=4096 (3 runs) | 3962.8–3964.3 ms | 1001.0–1002.5 ms | **3.95–3.96×** |
+| Purification n=2116 | 564.1–565.2 ms | 162.9–165.2 ms | 3.42–3.46× |
+| Purification n=1024 | 66.3–66.8 ms | 27.5–27.8 ms | 2.40–2.43× |
+| Black-Scholes 16M (4 full-suite runs) | 4.36–5.03 ms | 2.95–3.15 ms | 1.48–1.63×, median 1.60× |
+| Black-Scholes 64M (FMA run, spread ≤2%) | 16.458 ms | 9.372 ms | **1.76×** |
+| Matmul 2048² (4 runs) | 10.70–11.04 ms | 3.32–3.99 ms | 2.77–3.23×, median 2.86× |
+
+Purification errors identical to L40S/H100 (DS ‖P−Pexact‖ 3.9e-13 at 4096; f32 7.1e-4, up to 7.6e-3 electrons lost). FMA bound: 64M DS/DS+FMA* 0.97× (no gain, as on L40S); 16M 1.23× but DS+FMA* spread ±19%; 1M spreads ±49–112%, unusable. Run 1606's plain-f32 matmul column printed "-" (subprocess failure, not investigated).
 
 ### 6. Test Suite — Working ✅
 Confirmed 2026-06-19. Run from inside the container:
