@@ -34,9 +34,7 @@ NVCC="$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)"
 PLUGIN="cuda:$PWD/pjrt_plugin/build/libds_pjrt_plugin.so"
 
 {
-    echo "GPU    : $gpu"
-    echo "Date   : $(date -Is)"
-    echo "Commit : $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    bash tests/run_metadata.sh
     nvidia-smi --query-gpu=name,driver_version,clocks.max.sm,clocks.sm,power.limit,persistence_mode \
         --format=csv 2>/dev/null
     echo

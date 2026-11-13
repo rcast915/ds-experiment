@@ -57,6 +57,13 @@ echo "=== [3/3] Running setup, tests and benchmarks inside container ==="
 # run_full.sh rebuilds the plugin and mlir-ds-opt first (the image's own build
 # artifacts are shadowed by the bind mount), and keeps going past a failing
 # test step so the benchmarks still run. Its exit code is this job's.
+# Record which image this run used (checksum cached next to the .sif).
+if [ ! -f "$SIF.sha256" ] || [ "$SIF" -nt "$SIF.sha256" ]; then
+    sha256sum "$SIF" | cut -c1-16 > "$SIF.sha256"
+fi
+export DS_IMAGE_ID="docker://rcast915/ds-experiment:latest, pulled $(date -r "$SIF" +%F), sif sha256 $(cat "$SIF.sha256")..."
+export APPTAINERENV_DS_IMAGE_ID="$DS_IMAGE_ID" SINGULARITYENV_DS_IMAGE_ID="$DS_IMAGE_ID"
+
 singularity exec --nv --writable \
   --bind "$PROJECT_DIR":/src/ds_experiment \
   "$SANDBOX" bash -c "

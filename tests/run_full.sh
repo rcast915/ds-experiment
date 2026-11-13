@@ -70,11 +70,7 @@ build_pass() {
 }
 
 main() {
-    echo "GPU     : $GPU"
-    echo "Date    : $(date -Is)"
-    echo "Host    : $(hostname)"
-    echo "Commit  : $(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
-         "$(git diff --quiet HEAD 2>/dev/null || echo '(with uncommitted changes)')"
+    bash tests/run_metadata.sh
 
     step "setup: ds_setup.sh" bash ds_setup.sh
     step "build: mlir-ds-opt" build_pass

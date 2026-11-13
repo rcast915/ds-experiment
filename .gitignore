@@ -15,3 +15,4 @@ ds-sandbox/
 
 # Build outputs of the standalone DS matmul benchmark
 cpp/ds_gemm/build/
+*.sif.sha256

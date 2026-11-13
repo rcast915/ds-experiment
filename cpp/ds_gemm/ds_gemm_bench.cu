@@ -19,6 +19,13 @@
 // Build and run (inside the container; needs a GPU at build time for -arch=native):
 //   nvcc -O3 -std=c++17 -arch=native -o ds_gemm_bench ds_gemm_bench.cu -lcublas
 //   ./ds_gemm_bench [n ...]
+//
+// With -DWITH_FP64_EMULATION (needs cuBLAS from CUDA 13.0 Update 2 or newer;
+// see tests/run_cublas_emulation.sh) a fourth column times cuBLAS DGEMM with
+// its FP64 emulation enabled (math mode CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH,
+// Ozaki scheme on integer tensor cores), with its error against native DGEMM.
+// cuBLAS may fall back to native FP64 when it decides emulation cannot reach
+// FP64 accuracy, so a time equal to DGEMM's means it did not emulate.
 
 #include <cstdio>
 #include <cstdlib>
@@ -87,6 +94,18 @@ int main(int argc, char** argv) {
     cublasHandle_t h;
     CUBLAS_CHECK(cublasCreate(&h));
     CUBLAS_CHECK(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH));   // no TF32 for SGEMM
+    int cublas_ver = 0;
+    CUBLAS_CHECK(cublasGetVersion(h, &cublas_ver));
+    printf("cuBLAS version %d\n", cublas_ver);
+#ifdef WITH_FP64_EMULATION
+    // Separate handle so the native DGEMM above stays native.
+    cublasHandle_t he;
+    CUBLAS_CHECK(cublasCreate(&he));
+    CUBLAS_CHECK(cublasSetMathMode(he, CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH));
+    const char* strat = getenv("CUBLAS_EMULATION_STRATEGY");
+    printf("cuBLAS FP64 emulation: on (CUBLAS_FP64_EMULATED_FIXEDPOINT_MATH), strategy env = %s\n\n",
+           strat ? strat : "(unset: cuBLAS default)");
+#endif
 
     printf("%6s | %9s %8s | %9s %8s %9s | %9s %9s %8s %9s | %8s %8s\n",
            "n", "DGEMM ms", "GFLOP/s", "SGEMM ms", "GFLOP/s", "err", "DS ms", "split ms",
@@ -133,6 +152,14 @@ int main(int argc, char** argv) {
             split_kernel<<<sblocks, sthreads>>>(dA, dAh, dAl, nn);
             split_kernel<<<sblocks, sthreads>>>(dB, dBh, dBl, nn);
         };
+#ifdef WITH_FP64_EMULATION
+        double* dCemu;
+        CUDA_CHECK(cudaMalloc(&dCemu, nn * 8));
+        auto emugemm = [&] {
+            CUBLAS_CHECK(cublasDgemm(he, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                                     &one, dB, n, dA, n, &zero, dCemu, n));
+        };
+#endif
         auto dsgemm = [&] {
             ds_gemm_launch(n, n, n, dAh, dAl, dBh, dBl, dCds, nullptr, nullptr);
         };
@@ -141,6 +168,12 @@ int main(int argc, char** argv) {
         double t_s = time_ms(sgemm);
         double t_split = time_ms(split);
         double t_ds = time_ms(dsgemm);
+#ifdef WITH_FP64_EMULATION
+        double t_emu = time_ms(emugemm);
+        std::vector<double> cemu(nn);
+        CUDA_CHECK(cudaMemcpy(cemu.data(), dCemu, nn * 8, cudaMemcpyDeviceToHost));
+        cudaFree(dCemu);
+#endif
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -169,12 +202,20 @@ int main(int argc, char** argv) {
                n, t_d, flops / t_d / 1e6, t_s, flops / t_s / 1e6, rel_frobenius(c32d, c64),
                t_ds, t_split, flops / t_ds / 1e6, rel_frobenius(cds, c64),
                t_d / (t_ds + t_split), dgemm_err);
+#ifdef WITH_FP64_EMULATION
+        printf("%6s   emulated DGEMM %9.3f ms %8.0f GFLOP/s  err %9.2e  DGEMM/emu %6.2fx  emu vs DS %6.2fx\n",
+               "", t_emu, flops / t_emu / 1e6, rel_frobenius(cemu, c64),
+               t_d / t_emu, (t_ds + t_split) / t_emu);
+#endif
 
         cudaFree(dA); cudaFree(dB); cudaFree(dC64); cudaFree(dCds);
         cudaFree(dAh); cudaFree(dAl); cudaFree(dBh); cudaFree(dBl);
         cudaFree(fdA); cudaFree(fdB); cudaFree(fdC);
     }
     cublasDestroy(h);
+#ifdef WITH_FP64_EMULATION
+    cublasDestroy(he);
+#endif
 
     printf("\nDGEMM/DS > 1 means the DS kernel (split included) is faster than native f64.\n");
     printf("Go/no-go (L40S, n=2048): DGEMM/DS >= 1.5x with DS err < 1e-12.\n");

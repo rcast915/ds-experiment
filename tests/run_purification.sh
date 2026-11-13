@@ -20,9 +20,7 @@ mkdir -p results
 OUT="results/$(echo "$gpu" | tr -c 'A-Za-z0-9\n' '-')_purification_${1:-$(date +%Y%m%d-%H%M%S)}.txt"
 
 {
-    echo "GPU    : $gpu"
-    echo "Date   : $(date -Is)"
-    echo "Commit : $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    bash tests/run_metadata.sh
     bash ds_setup.sh || exit 1
     cmake -GNinja -S stablehlo_pass -B stablehlo_pass/build -DCMAKE_CXX_FLAGS="-fno-rtti" > /dev/null \
         && ninja -C stablehlo_pass/build || exit 1

@@ -23,9 +23,7 @@ OUT="results/${gpu}_ds-gemm_${1:-$(date +%Y%m%d-%H%M%S)}.txt"
 NVCC="$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)"
 
 {
-    echo "GPU    : $gpu"
-    echo "Date   : $(date -Is)"
-    echo "Commit : $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    bash tests/run_metadata.sh
     echo
 
     echo "=== CPU check of the DS arithmetic ==="

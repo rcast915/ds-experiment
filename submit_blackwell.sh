@@ -74,6 +74,13 @@ fi
 #    mlir-ds-opt first (the image's own build artifacts are shadowed by the
 #    bind mount) and keeps going past a failing step. Its exit code is the
 #    job's.
+# Record which image this run used (checksum cached next to the .sif).
+if [ ! -f "$SIF.sha256" ] || [ "$SIF" -nt "$SIF.sha256" ]; then
+    sha256sum "$SIF" | cut -c1-16 > "$SIF.sha256"
+fi
+export DS_IMAGE_ID="docker://rcast915/ds-experiment:latest, pulled $(date -r "$SIF" +%F), sif sha256 $(cat "$SIF.sha256")..."
+export APPTAINERENV_DS_IMAGE_ID="$DS_IMAGE_ID" SINGULARITYENV_DS_IMAGE_ID="$DS_IMAGE_ID"
+
 echo "Starting full DS run..."
 "$CT" exec --nv --writable \
   --bind "$(pwd)":/src/ds_experiment \
