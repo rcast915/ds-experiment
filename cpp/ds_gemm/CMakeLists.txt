@@ -10,8 +10,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  # Ampere, Ada (L40S), Hopper (H100); compute_90 PTX lets newer GPUs JIT it.
-  set(CMAKE_CUDA_ARCHITECTURES "80-real;89-real;90")
+  # Turing (T4), Ampere (A100; A6000/A2000), Ada (L40S), Hopper (H100),
+  # Blackwell RTX PRO (sm_120); compute_90 PTX lets other newer GPUs JIT it.
+  # PTX only runs on its own or a newer architecture, so older GPUs need
+  # their own entry here.
+  set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-real;120-real;90-virtual")
 endif()
 
 find_package(CUDAToolkit REQUIRED)

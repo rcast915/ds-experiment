@@ -6,31 +6,37 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
-#SBATCH --partition=stravinsky
-##SBATCH --gres=gpu:1
+# No partition here: orthus has no default GPU partition, so pass one.
 #
-# orthus.nic.uoregon.edu (University of Oregon NIC), partition `stravinsky`:
-# run the full DS suite (tests, benchmarks including Black-Scholes,
-# pair-accuracy sections, per-op f64 and matmul diagnostics).
+# University of Oregon NIC (orthus.nic.uoregon.edu). Runs the full DS suite
+# (tests, Black-Scholes, diagnostics), or another job script, in the
+# container. Works two ways:
 #
-# Same Slurm settings and container flow as the earlier
-# run_blackwell_reeval.sh on that machine; only the payload differs.
+# 1. Through Slurm, for GPU nodes that are Slurm partitions:
+#      godzilla   T4 (Turing)          picard   2 x A2000 (Ampere)
 #
-# Submit from the repo root on orthus:
+#      cd ~/ds-experiment && git pull
+#      mkdir -p logs/output logs/error      # sbatch needs these to exist
+#      sbatch -p godzilla submit_blackwell.sh
+#      sbatch -p godzilla --dependency=singleton \
+#             --export=ALL,DS_JOB_SCRIPT=tests/run_purification.sh submit_blackwell.sh
 #
-#   cd ~/ds-experiment && git pull
-#   mkdir -p logs/output logs/error      # sbatch needs these to exist
-#   sbatch submit_blackwell.sh
+#    --dependency=singleton waits for the earlier job of the same name, so
+#    two jobs never rebuild the pass at the same time.
 #
-# Watch:    tail -f logs/output/blackwell_<JOBID>.out
-# Results:  results/<gpu-model>_<JOBID>.txt
+# 2. Directly, on servers outside Slurm (Stravinsky: RTX PRO 6000 Blackwell;
+#    Icarus: 3 x RTX A6000). ssh to the server, then from the repo root:
+#      nohup bash submit_blackwell.sh > logs/output/direct_$(hostname -s).out 2>&1 &
+#      DS_JOB_SCRIPT=tests/run_purification.sh nohup bash submit_blackwell.sh \
+#            > logs/output/purif_$(hostname -s).out 2>&1 &     # after the first one ends
+#
+# Watch:    tail -f logs/output/<file>.out
+# Results:  results/<gpu-model>_<label>.txt
 #
 # The image (ds-experiment.sif) and the writable sandbox (ds-sandbox/) live in
 # the repo directory and are reused if present. Delete both to force a fresh
-# pull, e.g. after the Docker image has been rebuilt.
-#
-# To run a different job script (e.g. only the FMA upper-bound benchmark):
-#   sbatch --export=ALL,DS_JOB_SCRIPT=tests/run_fma_bound.sh submit_blackwell.sh
+# pull, e.g. after the Docker image has been rebuilt. They are x86 only: do
+# not use the grace / hopper (ARM) nodes.
 #
 # The job runs whatever is checked out — it does not pull.
 
@@ -39,7 +45,7 @@ mkdir -p logs/output logs/error
 
 echo "Job started: $(date) on $(hostname)"
 
-cd "$SLURM_SUBMIT_DIR"
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$(readlink -f "$0")")}"
 
 # 1. Temporary directories, to avoid permission/space issues
 export APPTAINER_CACHEDIR=/tmp/$USER-apptainer-cache
@@ -47,17 +53,21 @@ export APPTAINER_TMPDIR=/tmp/$USER-apptainer-tmp
 mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 
 # 2. Pull the pre-built image from Docker Hub
+# Apptainer and Singularity take the same commands; use whichever exists.
+CT="$(command -v apptainer || command -v singularity)" \
+    || { echo "Neither apptainer nor singularity is installed on $(hostname)."; exit 1; }
+
 SIF="ds-experiment.sif"
 if [ ! -f "$SIF" ]; then
     echo "Pulling image from Docker Hub..."
-    singularity pull "$SIF" docker://rcast915/ds-experiment:latest || exit 1
+    "$CT" pull "$SIF" docker://rcast915/ds-experiment:latest || exit 1
 fi
 
 # 3. Build a writable sandbox
 SANDBOX="ds-sandbox"
 if [ ! -d "$SANDBOX" ]; then
     echo "Building writable sandbox..."
-    singularity build --sandbox "$SANDBOX" "$SIF" || exit 1
+    "$CT" build --sandbox "$SANDBOX" "$SIF" || exit 1
 fi
 
 # 4. Run everything inside the container. run_full.sh rebuilds the plugin and
@@ -65,11 +75,11 @@ fi
 #    bind mount) and keeps going past a failing step. Its exit code is the
 #    job's.
 echo "Starting full DS run..."
-singularity exec --nv --writable \
+"$CT" exec --nv --writable \
   --bind "$(pwd)":/src/ds_experiment \
   "$SANDBOX" bash -c "
     cd /src/ds_experiment
-    bash ${DS_JOB_SCRIPT:-tests/run_full.sh} '${SLURM_JOB_ID:-manual}'
+    bash ${DS_JOB_SCRIPT:-tests/run_full.sh} '${SLURM_JOB_ID:-$(hostname -s)-$(date +%m%d-%H%M)}'
   "
 rc=$?
 
