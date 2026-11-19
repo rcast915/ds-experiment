@@ -16,3 +16,6 @@ ds-sandbox/
 # Build outputs of the standalone DS matmul benchmark
 cpp/ds_gemm/build/
 *.sif.sha256
+
+# CUDA 13 JAX venv for the XLA emulation probe
+.venv-cuda13/
