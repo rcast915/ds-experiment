@@ -1002,9 +1002,11 @@ struct DsTransformPass
             Location loc = op->getLoc();
 
             // ── stablehlo.constant ────────────────────────────────────────
-            // Add constant tensors to dsMap as (constant, 0) so downstream
-            // arithmetic ops (e.g. a + 1.0) can be DS-transformed.
-            // The original op is kept — hi is the constant's own result.
+            // Add constant tensors to dsMap so downstream arithmetic ops
+            // (e.g. a + 1.0) can be DS-transformed. f32 constants enter as
+            // (c, 0); f64 constants are split like f64 arguments
+            // (emitFromFloat), so they keep their low word. The original op
+            // is kept.
             //
             // Insert AFTER the constant, not before: for f64 constants,
             // emitFromFloat creates ConvertOps that reference this op's
