@@ -11,7 +11,8 @@ with CUBLAS_EMULATE_DOUBLE_PRECISION=1, since XLA never sets the emulated math
 mode on its handle. Reports exist that this has no effect under JAX, which is
 what this probe checks.
 
-Configurations, each in its own subprocess (env vars are read at cuBLAS init):
+Configurations, each in its own subprocess (env vars are read at cuBLAS init);
+legacy* also set --xla_gpu_enable_cublaslt=false (classic cuBLAS GEMM call):
   triton      XLA default (Triton GEMM)
   cublas      Triton GEMM off -> native cuBLAS DGEMM
   cublas+emu  Triton GEMM off, CUBLAS_EMULATE_DOUBLE_PRECISION=1
@@ -36,12 +37,20 @@ import numpy as np
 SIZES = [int(a) for a in sys.argv[1:]] or [2048, 4096]
 REPS = 10
 
+NO_TRITON = "--xla_gpu_enable_triton_gemm=false"
+LEGACY = NO_TRITON + " --xla_gpu_enable_cublaslt=false"   # classic cublasGemmEx path
+EMU = {"CUBLAS_EMULATE_DOUBLE_PRECISION": "1"}
+EAGER = dict(EMU, CUBLAS_EMULATION_STRATEGY="eager")
+
+# name, XLA_FLAGS, extra env, native config to compare against
 CONFIGS = [
-    ("triton",     "",                                   {}),
-    ("cublas",     "--xla_gpu_enable_triton_gemm=false", {}),
-    ("cublas+emu", "--xla_gpu_enable_triton_gemm=false", {"CUBLAS_EMULATE_DOUBLE_PRECISION": "1"}),
-    ("+eager",     "--xla_gpu_enable_triton_gemm=false", {"CUBLAS_EMULATE_DOUBLE_PRECISION": "1",
-                                                          "CUBLAS_EMULATION_STRATEGY": "eager"}),
+    ("triton",      "",        {},    None),
+    ("cublas",      NO_TRITON, {},    None),
+    ("cublas+emu",  NO_TRITON, EMU,   "cublas"),
+    ("+eager",      NO_TRITON, EAGER, "cublas"),
+    ("legacy",      LEGACY,    {},    None),
+    ("legacy+emu",  LEGACY,    EMU,   "legacy"),
+    ("legacy+eager", LEGACY,   EAGER, "legacy"),
 ]
 
 # argv: n, input .npz, output .npy
@@ -109,7 +118,7 @@ def main():
             nref = np.linalg.norm(ref)
             print(f"n = {n}")
             res, outs = {}, {}
-            for name, flags, extra in CONFIGS:
+            for name, flags, extra, _ in CONFIGS:
                 out = os.path.join(tmp, f"{name}.npy")
                 r = run(n, flags, extra, inp, out)
                 if r is None:
@@ -117,26 +126,24 @@ def main():
                 c = np.load(out)
                 r["err"] = float(np.linalg.norm(c - ref) / nref)
                 res[name], outs[name] = r, c
-                print(f"  {name:11s} {r['ms']:9.3f} ms  err vs NumPy {r['err']:.2e}  "
-                      f"GEMM path: {r['kind']} {r['targets']}")
-            if "cublas" in res:
-                base, cb = res["cublas"], outs["cublas"]
-                if base["kind"] != "cublas":
-                    print("  ! Triton GEMM off did not route the dot to cuBLAS; emulation cannot apply.")
-                for name in ("cublas+emu", "+eager"):
-                    if name not in res:
-                        continue
-                    r = res[name]
-                    speed = base["ms"] / r["ms"]
-                    same = np.array_equal(outs[name], cb)
-                    taken = speed >= 1.5 and not same
-                    verdicts.append((n, name, taken, r["err"]))
-                    print(f"  {name:11s} vs native cuBLAS: {speed:.2f}x faster, output "
-                          f"{'bitwise identical' if same else 'differs'} -> emulation "
-                          f"{'TAKEN' if taken else 'NOT taken'}")
-                if "triton" in res:
-                    print(f"  native cuBLAS vs Triton: {res['triton']['ms'] / base['ms']:.2f}x "
-                          f"(>1 means cuBLAS is faster)")
+                same_tr = ("triton" in outs and name != "triton"
+                           and np.array_equal(c, outs["triton"]))
+                print(f"  {name:12s} {r['ms']:9.3f} ms  err vs NumPy {r['err']:.2e}  "
+                      f"GEMM path: {r['kind']} {r['targets']}"
+                      + ("  [bitwise identical to triton]" if same_tr else ""))
+            for name, _, _, base_name in CONFIGS:
+                if base_name is None or name not in res or base_name not in res:
+                    continue
+                base, r = res[base_name], res[name]
+                if base["kind"] != "cublas" or r["kind"] != "cublas":
+                    print(f"  ! {name}: dot not routed to cuBLAS; emulation cannot apply.")
+                speed = base["ms"] / r["ms"]
+                same = np.array_equal(outs[name], outs[base_name])
+                taken = speed >= 1.5 and not same
+                verdicts.append((n, name, taken, r["err"]))
+                print(f"  {name:12s} vs {base_name}: {speed:.2f}x faster, output "
+                      f"{'bitwise identical' if same else 'differs'} -> emulation "
+                      f"{'TAKEN' if taken else 'NOT taken'}")
             print()
 
     taken = [v for v in verdicts if v[2]]
