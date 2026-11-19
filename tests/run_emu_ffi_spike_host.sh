@@ -18,7 +18,7 @@ CT="$(command -v apptainer || command -v singularity)" \
     || { echo "Neither apptainer nor singularity is installed on $(hostname)."; exit 1; }
 export APPTAINER_CACHEDIR=/tmp/$USER-apptainer-cache APPTAINER_TMPDIR=/tmp/$USER-apptainer-tmp
 mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR" results cpp/emu_gemm/build
-for need in python312.sif .venv-cuda13/bin/python; do
+for need in python312.sif .venv-cuda13/pyvenv.cfg; do   # bin/python links into the container
     [ -e "$need" ] || { echo "Missing $need: run tests/run_xla_emulation_probe_host.sh first."; exit 1; }
 done
 [ -f cuda13-devel.sif ] || "$CT" pull cuda13-devel.sif docker://nvidia/cuda:13.0.2-devel-ubuntu24.04 || exit 1
