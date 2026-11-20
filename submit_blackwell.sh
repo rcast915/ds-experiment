@@ -71,7 +71,10 @@ fi
 SANDBOX="ds-sandbox-$DS_TAG"
 if [ ! -d "$SANDBOX" ]; then
     echo "Building writable sandbox..."
-    "$CT" build --sandbox "$SANDBOX" "$SIF" || exit 1
+    # Built from the registry, not from the .sif: Singularity CE 4.x fails on
+    # the CUDA 13 image's .sif with "symlinkat /.singularity.d/runscript
+    # singularity: file exists". The .sif is still pulled for the checksum.
+    "$CT" build --sandbox "$SANDBOX" $DS_IMAGE || { rm -rf "$SANDBOX"; exit 1; }
 fi
 
 # 4. Run everything inside the container. run_full.sh rebuilds the plugin and

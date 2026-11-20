@@ -52,7 +52,10 @@ singularity pull "$SIF" $DS_IMAGE
 
 echo "=== [2/3] Building writable sandbox on \$LOCAL ==="
 SANDBOX="$LOCAL/ds-sandbox-$DS_TAG"
-singularity build --sandbox "$SANDBOX" "$SIF"
+# Built from the registry, not from the .sif: Singularity CE 4.x fails on
+# the CUDA 13 image's .sif with "symlinkat /.singularity.d/runscript
+# singularity: file exists". The .sif is still pulled for the checksum.
+singularity build --sandbox "$SANDBOX" $DS_IMAGE
 
 # Create Bridges-2 filesystem mount points that Apptainer expects
 mkdir -p "$SANDBOX/jet" "$SANDBOX/ocean"

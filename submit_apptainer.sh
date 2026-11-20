@@ -87,7 +87,10 @@ mkdir -p "$APPTAINER_TMPDIR"
 echo "=== [2/3] Building writable sandbox ==="
 # ds_setup.sh renames JAX's CUDA plugin directories inside the image, so the
 # container filesystem has to be writable.
-"$CT" build --sandbox "$SANDBOX" "$SIF"
+# Built from the registry, not from the .sif: Singularity CE 4.x fails on
+# the CUDA 13 image's .sif with "symlinkat /.singularity.d/runscript
+# singularity: file exists". The .sif is still pulled for the checksum.
+"$CT" build --sandbox "$SANDBOX" $DS_IMAGE
 
 for d in ${DS_MOUNT_STUBS:-}; do
     mkdir -p "$SANDBOX$d"
