@@ -167,18 +167,24 @@ static PJRT_Error* ds_compile_wrapper(PJRT_Client_Compile_Args* args) {
         return real_compile_fn(args);
     }
 
-    // Log the serialized program's StableHLO producer once, as evidence that
-    // version negotiation worked (expect StableHLO_v1.16.3).
-    static bool producer_logged = false;
-    if (!producer_logged && args->program->code_size > 16) {
+    // Check every program's StableHLO producer, as evidence that version
+    // negotiation worked: each one must be StableHLO_v<DS_PASS_STABLEHLO>.
+    // One line per program, so a log can be checked program by program; a
+    // mismatch (or no producer found) is a fallback, i.e. an abort under
+    // DS_STRICT=1.
+    {
         std::string head(args->program->code,
                          std::min<size_t>(args->program->code_size, 256));
         size_t at = head.find("StableHLO_v");
+        std::string producer = "unknown producer";
         if (at != std::string::npos) {
             size_t end = head.find_first_not_of("0123456789.", at + 11);
-            fprintf(stderr, "[ds_pjrt] JAX program serialized by %s\n",
-                    head.substr(at, end - at).c_str());
-            producer_logged = true;
+            producer = head.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        }
+        fprintf(stderr, "[ds_pjrt] JAX program serialized by %s\n", producer.c_str());
+        if (producer != "StableHLO_v" DS_PASS_STABLEHLO) {
+            return fall_back(args, ("StableHLO version mismatch: program serialized by " + producer +
+                                    ", pass expects StableHLO_v" DS_PASS_STABLEHLO).c_str());
         }
     }
 

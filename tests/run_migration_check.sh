@@ -42,13 +42,21 @@ count() { cat "${logs[@]}" 2>/dev/null | grep -c "$1"; }
 echo "  backend StableHLO / reported : $(cat "${logs[@]}" 2>/dev/null | grep -m1 -o 'StableHLO: backend.*' || echo 'not logged')"
 echo "  programs serialized by       : $(cat "${logs[@]}" 2>/dev/null | grep -o 'serialized by StableHLO_v[0-9.]*' | sort | uniq -c | tr '\n' ' ')"
 echo "  programs transformed         : $(count '\[ds_pjrt\] transformed')"
+echo "  programs checked / at 1.16.3 : $(count 'serialized by') / $(count 'serialized by StableHLO_v1\.16\.3$')"
+echo "  version mismatches           : $(count 'StableHLO version mismatch')"
 echo "  pass failures / aborts       : $(count 'Pass failed')"
+echo "  fallbacks / strict aborts    : $(count 'Falling back') / $(count 'DS_STRICT=1:')"
 echo "  DS matmul kernel registered  : $(count 'DS matmul kernel registered')"
 echo "  run_full.sh exit             : $rc_full"
 echo "  run_purification.sh exit     : $rc_pur"
 ok=1
 [[ $rc_full -eq 0 && $rc_pur -eq 0 ]] || ok=0
 [[ $(count 'Pass failed') -eq 0 ]] || ok=0
+# Every program is checked (one 'serialized by' line each): all at 1.16.3,
+# none mismatched or fallen back, and at least as many as were transformed.
+[[ $(count 'serialized by') -eq $(count 'serialized by StableHLO_v1\.16\.3$') ]] || ok=0
+[[ $(count 'serialized by') -ge $(count '\[ds_pjrt\] transformed') ]] || ok=0
+[[ $(count 'StableHLO version mismatch') -eq 0 && $(count 'Falling back') -eq 0 && $(count 'DS_STRICT=1:') -eq 0 ]] || ok=0
 [[ $(count '\[ds_pjrt\] transformed') -gt 0 ]] || ok=0
 cat "${logs[@]}" 2>/dev/null | grep -o 'serialized by StableHLO_v[0-9.]*' | grep -qv 'v1\.16\.3$' && ok=0
 echo "  VERDICT: $([[ $ok -eq 1 ]] && echo 'PASS -- pass and ds_gemm work on the new image' || echo 'FAIL -- see above and the logs')"
