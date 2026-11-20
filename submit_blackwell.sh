@@ -33,7 +33,7 @@
 # Watch:    tail -f logs/output/<file>.out
 # Results:  results/<gpu-model>_<label>.txt
 #
-# The image (ds-experiment.sif) and the writable sandbox (ds-sandbox/) live in
+# The image (ds-experiment-<tag>.sif) and the writable sandbox (ds-sandbox-<tag>/) live in
 # the repo directory and are reused if present. Delete both to force a fresh
 # pull, e.g. after the Docker image has been rebuilt. They are x86 only: do
 # not use the grace / hopper (ARM) nodes.
@@ -57,14 +57,18 @@ mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 CT="$(command -v apptainer || command -v singularity)" \
     || { echo "Neither apptainer nor singularity is installed on $(hostname)."; exit 1; }
 
-SIF="ds-experiment.sif"
+# Image tag: cuda13 (CUDA 13.0.2, JAX 0.12.1) by default; DS_TAG=latest selects
+# the earlier CUDA 12.9 / JAX 0.10.1 image. Each tag gets its own .sif/sandbox.
+DS_TAG="${DS_TAG:-cuda13}"
+DS_IMAGE="docker://rcast915/ds-experiment:$DS_TAG"
+SIF="ds-experiment-$DS_TAG.sif"
 if [ ! -f "$SIF" ]; then
     echo "Pulling image from Docker Hub..."
-    "$CT" pull "$SIF" docker://rcast915/ds-experiment:latest || exit 1
+    "$CT" pull "$SIF" $DS_IMAGE || exit 1
 fi
 
 # 3. Build a writable sandbox
-SANDBOX="ds-sandbox"
+SANDBOX="ds-sandbox-$DS_TAG"
 if [ ! -d "$SANDBOX" ]; then
     echo "Building writable sandbox..."
     "$CT" build --sandbox "$SANDBOX" "$SIF" || exit 1
@@ -78,7 +82,7 @@ fi
 if [ ! -f "$SIF.sha256" ] || [ "$SIF" -nt "$SIF.sha256" ]; then
     sha256sum "$SIF" | cut -c1-16 > "$SIF.sha256"
 fi
-export DS_IMAGE_ID="docker://rcast915/ds-experiment:latest, pulled $(date -r "$SIF" +%F), sif sha256 $(cat "$SIF.sha256")..."
+export DS_IMAGE_ID="$DS_IMAGE, pulled $(date -r "$SIF" +%F), sif sha256 $(cat "$SIF.sha256")..."
 export APPTAINERENV_DS_IMAGE_ID="$DS_IMAGE_ID" SINGULARITYENV_DS_IMAGE_ID="$DS_IMAGE_ID"
 
 echo "Starting full DS run..."

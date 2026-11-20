@@ -1,42 +1,20 @@
-FROM nvidia/cuda:12.9.1-devel-ubuntu24.04
+# Two stages. Stage 1 builds LLVM/MLIR + StableHLO (CUDA-independent, ~1 h);
+# stage 2 is the CUDA 13 runtime image and copies /opt/mlir from stage 1, so a
+# CUDA or JAX change does not rebuild LLVM.
+#
+# Versions: CUDA 13.0.2 · Python 3.12 · JAX 0.12.1 (jax[cuda13]) · StableHLO
+# 1.16.3 for the pass. JAX 0.12.1 itself is at StableHLO 1.25.3; the PJRT
+# proxy reports 1.16.3 to JAX so programs reach the pass in a version it can
+# parse (see pjrt_plugin/ds_pjrt_plugin.cpp, kPassStablehlo).
+
+# ══ Stage 1: LLVM/MLIR + StableHLO ═══════════════════════════════════════════
+FROM ubuntu:24.04 AS mlir
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
-
-# ── System packages ────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y \
-    python3.12 python3.12-dev python3-pip \
-    cmake ninja-build git wget curl vim \
-    build-essential lsb-release \
+    cmake ninja-build git build-essential python3 \
     libzstd-dev zlib1g-dev libffi-dev libxml2-dev \
     && rm -rf /var/lib/apt/lists/*
-
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
-    update-alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
-
-# ── Python / JAX ───────────────────────────────────────────────────────────────
-RUN pip install "jax[cuda12]" numpy
-
-# Disable JAX CUDA auto-registration so our PJRT proxy can claim the cuda slot.
-# ds_pjrt_plugin.cpp hardcodes xla_cuda12_disabled as the real plugin path.
-RUN mv /usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12 \
-       /usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12_disabled && \
-    mv /usr/local/lib/python3.12/dist-packages/jax_cuda12_plugin \
-       /usr/local/lib/python3.12/dist-packages/jax_cuda12_plugin_disabled
-
-# ── XLA FFI headers ────────────────────────────────────────────────────────────
-RUN mkdir -p /opt/xla-ffi/xla/ffi/api
-RUN wget -q -O /opt/xla-ffi/xla/ffi/api/c_api.h \
-      https://raw.githubusercontent.com/openxla/xla/main/xla/ffi/api/c_api.h && \
-    wget -q -O /opt/xla-ffi/xla/ffi/api/api.h \
-      https://raw.githubusercontent.com/openxla/xla/main/xla/ffi/api/api.h && \
-    wget -q -O /opt/xla-ffi/xla/ffi/api/ffi.h \
-      https://raw.githubusercontent.com/openxla/xla/main/xla/ffi/api/ffi.h
-
-# ── PJRT C API headers ────────────────────────────────────────────────────────
-RUN mkdir -p /opt/xla-pjrt/xla/pjrt/c && \
-    wget -q -O /opt/xla-pjrt/xla/pjrt/c/pjrt_c_api.h \
-      https://raw.githubusercontent.com/openxla/xla/main/xla/pjrt/c/pjrt_c_api.h
 
 # ── StableHLO (pinned to v1.16.3) ─────────────────────────────────────────────
 # Clone first so we can read its required LLVM commit before building LLVM.
@@ -87,6 +65,49 @@ RUN cmake -GNinja \
            cp "$f" "/opt/mlir/include/$rel"; \
          done \
     && rm -rf /tmp/stablehlo-src /tmp/stablehlo-build
+
+
+# ══ Stage 2: CUDA 13 runtime image ═══════════════════════════════════════════
+FROM nvidia/cuda:13.0.2-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+# ── System packages ────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    python3.12 python3.12-dev python3-pip \
+    cmake ninja-build git wget curl vim \
+    build-essential lsb-release \
+    libzstd-dev zlib1g-dev libffi-dev libxml2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
+
+COPY --from=mlir /opt/mlir /opt/mlir
+
+# ── Python / JAX (pinned) ──────────────────────────────────────────────────────
+RUN pip install "jax[cuda13]==0.12.1" numpy
+
+# Disable JAX CUDA auto-registration so our PJRT proxy can claim the cuda slot.
+# ds_pjrt_plugin.cpp loads xla_cuda13_disabled as the real plugin.
+RUN mv /usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda13 \
+       /usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda13_disabled && \
+    mv /usr/local/lib/python3.12/dist-packages/jax_cuda13_plugin \
+       /usr/local/lib/python3.12/dist-packages/jax_cuda13_plugin_disabled
+
+# ── XLA FFI headers: the ones shipped with jaxlib 0.12.1 ──────────────────────
+RUN ln -s "$(python3 -c 'import jax.ffi; print(jax.ffi.include_dir())')" /opt/xla-ffi && \
+    test -f /opt/xla-ffi/xla/ffi/api/ffi.h
+
+# ── PJRT C API headers at the XLA commit jaxlib 0.12.1 was built from ────────
+# (jax-v0.12.1 MODULE.bazel pins openxla/xla 97b8433b; PJRT API 0.118)
+ARG XLA_COMMIT=97b8433b3ed82b78b742f751d2c7f510e5d78d25
+RUN mkdir -p /opt/xla-pjrt/xla/pjrt/c && \
+    for h in pjrt_c_api.h pjrt_c_api_ffi_extension.h; do \
+      wget -q -O /opt/xla-pjrt/xla/pjrt/c/$h \
+        https://raw.githubusercontent.com/openxla/xla/${XLA_COMMIT}/xla/pjrt/c/$h || exit 1; \
+    done
 
 # ── PATH ───────────────────────────────────────────────────────────────────────
 ENV PATH="/opt/mlir/bin:${PATH}"

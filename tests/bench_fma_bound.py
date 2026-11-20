@@ -42,6 +42,7 @@ PLUGIN_SO    = PROJECT_ROOT / "pjrt_plugin" / "build" / "libds_pjrt_plugin.so"
 OPT_BINARY   = PROJECT_ROOT / "stablehlo_pass" / "build" / "mlir-ds-opt"
 
 sys.path.insert(0, str(TESTS_DIR))
+from ds_ir import pass_ready  # noqa: E402  (JAX 0.12.1 text -> StableHLO 1.16.3)
 from bench_blackscholes import _BENCH_CODE  # noqa: E402  (the Black-Scholes payload)
 
 WARMUP_REPS = 5
@@ -75,9 +76,10 @@ def count_ops() -> dict:
     def ops(text):
         return len(re.findall(r"=\s*\"?stablehlo\.", text))
 
+    text = pass_ready(r.stdout)
     with tempfile.NamedTemporaryFile("w", suffix=".mlir", delete=False) as f:
-        f.write(r.stdout)
-    out = {"native": ops(r.stdout)}
+        f.write(text)
+    out = {"native": ops(text)}
     for label, fake in (("DS", "0"), ("DS+FMA*", "1")):
         e = dict(env, DS_FAKE_FMA_TIMING=fake)
         p = subprocess.run(

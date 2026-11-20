@@ -61,8 +61,12 @@ fi
 
 SCRATCH_BASE="${DS_SCRATCH:-${LOCAL:-${SLURM_TMPDIR:-${TMPDIR:-/tmp}}}}"
 WORK="$SCRATCH_BASE/ds-${SLURM_JOB_ID:-manual}"
-SIF="$WORK/ds-experiment.sif"
-SANDBOX="$WORK/ds-sandbox"
+# Image tag: cuda13 (CUDA 13.0.2, JAX 0.12.1) by default; DS_TAG=latest selects
+# the earlier CUDA 12.9 / JAX 0.10.1 image. Each tag gets its own .sif/sandbox.
+DS_TAG="${DS_TAG:-cuda13}"
+DS_IMAGE="docker://rcast915/ds-experiment:$DS_TAG"
+SIF="$WORK/ds-experiment-$DS_TAG.sif"
+SANDBOX="$WORK/ds-sandbox-$DS_TAG"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -78,7 +82,7 @@ export SINGULARITY_CACHEDIR="$APPTAINER_CACHEDIR"
 export SINGULARITY_TMPDIR="$APPTAINER_TMPDIR"
 mkdir -p "$APPTAINER_TMPDIR"
 
-"$CT" pull "$SIF" docker://rcast915/ds-experiment:latest
+"$CT" pull "$SIF" $DS_IMAGE
 
 echo "=== [2/3] Building writable sandbox ==="
 # ds_setup.sh renames JAX's CUDA plugin directories inside the image, so the
@@ -93,7 +97,7 @@ done
 if [ ! -f "$SIF.sha256" ] || [ "$SIF" -nt "$SIF.sha256" ]; then
     sha256sum "$SIF" | cut -c1-16 > "$SIF.sha256"
 fi
-export DS_IMAGE_ID="docker://rcast915/ds-experiment:latest, pulled $(date -r "$SIF" +%F), sif sha256 $(cat "$SIF.sha256")..."
+export DS_IMAGE_ID="$DS_IMAGE, pulled $(date -r "$SIF" +%F), sif sha256 $(cat "$SIF.sha256")..."
 export APPTAINERENV_DS_IMAGE_ID="$DS_IMAGE_ID" SINGULARITYENV_DS_IMAGE_ID="$DS_IMAGE_ID"
 
 echo "=== [3/3] Running setup, tests and benchmarks inside container ==="

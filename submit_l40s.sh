@@ -37,17 +37,21 @@
 set -euo pipefail
 
 PROJECT_DIR="$HOME/ds-experiment"
-SIF="$LOCAL/ds-experiment.sif"
+# Image tag: cuda13 (CUDA 13.0.2, JAX 0.12.1) by default; DS_TAG=latest selects
+# the earlier CUDA 12.9 / JAX 0.10.1 image. Each tag gets its own .sif/sandbox.
+DS_TAG="${DS_TAG:-cuda13}"
+DS_IMAGE="docker://rcast915/ds-experiment:$DS_TAG"
+SIF="$LOCAL/ds-experiment-$DS_TAG.sif"
 
 echo "=== [1/3] Pulling Singularity image to \$LOCAL ==="
 export APPTAINER_CACHEDIR=$LOCAL/.apptainer
 export APPTAINER_TMPDIR=$LOCAL/.apptainer/tmp
 mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 
-singularity pull "$SIF" docker://rcast915/ds-experiment:latest
+singularity pull "$SIF" $DS_IMAGE
 
 echo "=== [2/3] Building writable sandbox on \$LOCAL ==="
-SANDBOX="$LOCAL/ds-sandbox"
+SANDBOX="$LOCAL/ds-sandbox-$DS_TAG"
 singularity build --sandbox "$SANDBOX" "$SIF"
 
 # Create Bridges-2 filesystem mount points that Apptainer expects
@@ -61,7 +65,7 @@ echo "=== [3/3] Running setup, tests and benchmarks inside container ==="
 if [ ! -f "$SIF.sha256" ] || [ "$SIF" -nt "$SIF.sha256" ]; then
     sha256sum "$SIF" | cut -c1-16 > "$SIF.sha256"
 fi
-export DS_IMAGE_ID="docker://rcast915/ds-experiment:latest, pulled $(date -r "$SIF" +%F), sif sha256 $(cat "$SIF.sha256")..."
+export DS_IMAGE_ID="$DS_IMAGE, pulled $(date -r "$SIF" +%F), sif sha256 $(cat "$SIF.sha256")..."
 export APPTAINERENV_DS_IMAGE_ID="$DS_IMAGE_ID" SINGULARITYENV_DS_IMAGE_ID="$DS_IMAGE_ID"
 
 singularity exec --nv --writable \

@@ -62,6 +62,8 @@ tail -f logs/output/build_JOBID.out
 
 **Versions:** CUDA 12.9.1 · Python 3.12 · StableHLO 1.16.3 · JAX 0.10.1 · GPU: H100 (sm_9.0a)
 
+**Image `:cuda13` (2026-11-20, replaces `:latest` for all new results):** CUDA 13.0.2 · Python 3.12 · JAX 0.12.1 (`jax[cuda13]`, StableHLO 1.25.3) · pass still on StableHLO 1.16.3. JAX's PJRT client serializes each program at min(JAX's version, the plugin's `stablehlo_current_version` attribute); the proxy reports 1.16.3, so the pass can parse every program (verified offline: JAX 0.12.1 → 1.16.3 bytecode → pass → read back by JAX 0.12.1). At 1.16.3, CHLO ops (e.g. `erf`) arrive as `stablehlo.composite`; the pipeline now runs `stablehlo-legalize-composite-to-call` before `inline`. Tests lower through `tests/ds_ir.py:pass_ready` (text from JAX 0.12.1 is not guaranteed to parse with the 1.16.3 parser). `DS_STRICT=1` makes the proxy abort instead of silently falling back to native f64. `ds_setup.sh` wipes build dirs when the toolchain changes. Gate for this step: `tests/run_migration_check.sh`. Known pre-existing gap: `log_plus_one` (log1p) is not transformed.
+
 ---
 
 ## Session Setup (required every container start — container is ephemeral `--rm`)

@@ -39,6 +39,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+from ds_ir import pass_ready   # JAX 0.12.1 text -> StableHLO 1.16.3 for the pass
 
 # Must be set before JAX is imported anywhere in this process.
 os.environ.setdefault("JAX_ENABLE_X64", "1")
@@ -168,7 +169,7 @@ def run_structural_tests():
     def lower_to_mlir(fn, *args):
         # ShapeDtypeStruct avoids device execution and the PJRT double-
         # registration crash (see handoff.md §Important Caveats).
-        return str(jax.jit(fn).lower(*args).compiler_ir())
+        return pass_ready(str(jax.jit(fn).lower(*args).compiler_ir()))
 
     def run_pass(mlir_text, tmp="/tmp/_ds_f64_test.mlir", extra_env=None):
         with open(tmp, "w") as f:

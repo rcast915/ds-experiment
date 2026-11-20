@@ -2,6 +2,9 @@ import subprocess
 import re
 import os
 import numpy as np
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests"))
+from ds_ir import pass_ready   # JAX 0.12.1 text -> StableHLO 1.16.3 for the pass
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["JAX_ENABLE_X64"] = "1"
@@ -42,7 +45,7 @@ def ds_sub_ffi(a, b):
     return ds_add_ffi(a, np.stack([-b[..., 0], -b[..., 1]], axis=-1))
 
 def run_pass(fn, *args):
-    mlir_text = str(jax.jit(fn).lower(*args).compiler_ir())
+    mlir_text = pass_ready(str(jax.jit(fn).lower(*args).compiler_ir()))
     with open('/tmp/_test.mlir', 'w') as f:
         f.write(mlir_text)
     r = subprocess.run(

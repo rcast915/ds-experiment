@@ -68,6 +68,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+from ds_ir import pass_ready   # JAX 0.12.1 text -> StableHLO 1.16.3 for the pass
 
 TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
@@ -222,7 +223,7 @@ def run_structural_tests():
         return
 
     def lower_to_mlir(fn, *args):
-        return str(jax.jit(fn).lower(*args).compiler_ir())
+        return pass_ready(str(jax.jit(fn).lower(*args).compiler_ir()))
 
     def run_pass(mlir_text, tmp_name):
         path = f"/tmp/{tmp_name}"

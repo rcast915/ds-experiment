@@ -11,7 +11,7 @@ logs/error/
 
 # Container image and sandbox kept in the repo dir on orthus
 *.sif
-ds-sandbox/
+ds-sandbox*/
 
 # Build outputs of the standalone DS matmul benchmark
 cpp/ds_gemm/build/
@@ -19,3 +19,4 @@ cpp/ds_gemm/build/
 
 # CUDA 13 JAX venv for the XLA emulation probe
 .venv-cuda13/
+.ds_build_stamp

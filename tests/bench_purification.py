@@ -39,6 +39,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+from ds_ir import pass_ready   # JAX 0.12.1 text -> StableHLO 1.16.3 for the pass
 
 TESTS_DIR    = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
@@ -140,8 +141,12 @@ def check_coverage():
                        env=env, capture_output=True, text=True)
     if r.returncode != 0:
         return f"could not lower purify(): {r.stderr[-300:]}"
+    try:
+        text = pass_ready(r.stdout)
+    except RuntimeError as e:
+        return f"could not convert purify() to StableHLO 1.16.3: {str(e)[-300:]}"
     with tempfile.NamedTemporaryFile("w", suffix=".mlir", delete=False) as f:
-        f.write(r.stdout)
+        f.write(text)
     env2 = dict(env, DS_WARN_UNSUPPORTED="1", DS_GEMM_KERNEL_AVAILABLE="1")
     p = subprocess.run([str(OPT_BINARY),
                         "--pass-pipeline=builtin.module(inline,func.func(ds-transform))", f.name],

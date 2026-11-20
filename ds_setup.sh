@@ -4,21 +4,35 @@
 # Note: once the Dockerfile is rebuilt, the rename steps become no-ops.
 set -e
 
-XPLUG=/usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda12
-JPKG=/usr/local/lib/python3.12/dist-packages/jax_cuda12_plugin
+XPLUG=/usr/local/lib/python3.12/dist-packages/jax_plugins/xla_cuda13
+JPKG=/usr/local/lib/python3.12/dist-packages/jax_cuda13_plugin
+
+# Build directories live in the bind-mounted repo, so they outlive the image.
+# If the toolchain changed (CUDA, JAX, MLIR), wipe them: otherwise CMake keeps
+# its cached paths and ninja may report "no work to do" with binaries built
+# against the old image.
+STAMP=".ds_build_stamp"
+want="cuda=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p') \
+jax=$(python3 -c 'import jax; print(jax.__version__)' 2>/dev/null) \
+mlir=$(ls -l --time-style=+%s /opt/mlir/bin/mlir-opt 2>/dev/null | awk '{print $6}')"
+if [ "$(cat "$STAMP" 2>/dev/null)" != "$want" ]; then
+    echo "[ds_setup] Toolchain changed ($(cat "$STAMP" 2>/dev/null || echo none) -> $want): clearing build directories"
+    rm -rf pjrt_plugin/build stablehlo_pass/build cpp/ds_gemm/build/ffi cpp/build
+    echo "$want" > "$STAMP"
+fi
 
 echo "[ds_setup] Step 1: disable JAX CUDA auto-registration"
 if [ -d "$XPLUG" ]; then
     mv "$XPLUG" "${XPLUG}_disabled"
-    echo "  renamed xla_cuda12 → xla_cuda12_disabled"
+    echo "  renamed xla_cuda13 → xla_cuda13_disabled"
 else
-    echo "  xla_cuda12 already disabled"
+    echo "  xla_cuda13 already disabled"
 fi
 if [ -d "$JPKG" ]; then
     mv "$JPKG" "${JPKG}_disabled"
-    echo "  renamed jax_cuda12_plugin → jax_cuda12_plugin_disabled"
+    echo "  renamed jax_cuda13_plugin → jax_cuda13_plugin_disabled"
 else
-    echo "  jax_cuda12_plugin already disabled"
+    echo "  jax_cuda13_plugin already disabled"
 fi
 
 echo "[ds_setup] Step 2: build PJRT plugin"

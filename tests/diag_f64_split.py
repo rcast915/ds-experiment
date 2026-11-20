@@ -115,6 +115,9 @@ if __name__ == "__main__":
     # ── 2. The pass's own output ─────────────────────────────────────────────
     section("2. mlir-ds-opt output for  lambda a: a + 0.0  (tensor<4xf64>)")
     mlir = run(_LOWER_CODE, {"JAX_PLATFORMS": "cpu", "PJRT_NAMES_AND_LIBRARY_PATHS": None})
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from ds_ir import pass_ready      # JAX 0.12.1 text -> StableHLO 1.16.3 for the pass
+    mlir = pass_ready(mlir)
     with tempfile.NamedTemporaryFile("w", suffix=".mlir", delete=False) as f:
         f.write(mlir)
     r = subprocess.run(

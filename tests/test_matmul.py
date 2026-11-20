@@ -33,6 +33,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+from ds_ir import pass_ready   # JAX 0.12.1 text -> StableHLO 1.16.3 for the pass
 
 TESTS_DIR    = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
@@ -173,7 +174,7 @@ def run_structural_tests():
     # Abstract args: lower() traces without executing on any device.
     # Avoids the PJRT double-registration crash in GPU mode.
     def run_pass(fn, *args):
-        mlir = str(jax.jit(fn).lower(*args).compiler_ir())
+        mlir = pass_ready(str(jax.jit(fn).lower(*args).compiler_ir()))
         with open("/tmp/_ds_matmul_test.mlir", "w") as f:
             f.write(mlir)
         return subprocess.run(
