@@ -6,8 +6,8 @@
 # failure aborts instead of silently running native f64, then checks the logs
 # for the StableHLO version negotiation.
 #
-#   DS_JOB_SCRIPT=tests/run_migration_check.sh nohup bash submit_blackwell.sh \
-#       > logs/output/migration_$(hostname -s).out 2>&1 &
+#   DS_JOB_SCRIPT=tests/run_migration_check.sh setsid nohup bash submit_blackwell.sh \
+#       > logs/output/migration_$(hostname -s).out 2>&1 < /dev/null &
 #
 # Output: results/<gpu>_<label>.txt (run_full), results/<gpu>_purification_<label>.txt,
 # and a verdict at the end of this script's own output.

@@ -26,9 +26,14 @@
 #
 # 2. Directly, on servers outside Slurm (Stravinsky: RTX PRO 6000 Blackwell;
 #    Icarus: 3 x RTX A6000). ssh to the server, then from the repo root:
-#      nohup bash submit_blackwell.sh > logs/output/direct_$(hostname -s).out 2>&1 &
-#      DS_JOB_SCRIPT=tests/run_purification.sh nohup bash submit_blackwell.sh \
-#            > logs/output/purif_$(hostname -s).out 2>&1 &     # after the first one ends
+#      setsid nohup bash submit_blackwell.sh \
+#            > logs/output/direct_$(hostname -s).out 2>&1 < /dev/null &
+#      DS_JOB_SCRIPT=tests/run_purification.sh setsid nohup bash submit_blackwell.sh \
+#            > logs/output/purif_$(hostname -s).out 2>&1 < /dev/null &   # after the first one ends
+#
+#    setsid, not just nohup: apptainer passes SIGHUP into the container, so a
+#    dropped ssh session kills a nohup-only run (exit 129). The shell prints
+#    "Done" at once (setsid forks); check with pgrep -af submit_blackwell.
 #
 # Watch:    tail -f logs/output/<file>.out
 # Results:  results/<gpu-model>_<label>.txt

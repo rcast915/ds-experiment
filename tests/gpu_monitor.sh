@@ -54,7 +54,10 @@ if [[ "$cmd" == stop ]]; then
     echo "GPU monitor summary: $csv"
     # Columns by header name; stats over samples with utilization > 50% (under load).
     awk -F', *' '
-        NR==1 { for (i=1;i<=NF;i++) { h=$i; sub(/ \[.*\]/,"",h); col[h]=i }; next }
+        # The header spells some queried fields out in full (clocks.sm is
+        # written as "clocks.current.sm [MHz]"), so map those back.
+        NR==1 { for (i=1;i<=NF;i++) { h=$i; sub(/ \[.*\]/,"",h); sub(/^clocks\.current\./,"clocks.",h)
+                                       if (h=="clocks.memory") h="clocks.mem"; col[h]=i }; next }
         function v(name) { return (name in col) ? $(col[name]) : "" }
         {
             n_all++

@@ -4,8 +4,8 @@
 # (DS_BYPASS=1), and serialized at the pass's StableHLO 1.16.3?
 #
 #   bash tests/run_baseline_check.sh [label]
-#   DS_JOB_SCRIPT=tests/run_baseline_check.sh nohup bash submit_blackwell.sh \
-#       > logs/output/baseline_$(hostname -s).out 2>&1 &
+#   DS_JOB_SCRIPT=tests/run_baseline_check.sh setsid nohup bash submit_blackwell.sh \
+#       > logs/output/baseline_$(hostname -s).out 2>&1 < /dev/null &
 #
 # Output is also written to results/<gpu>_baseline_<label>.txt.
 #
