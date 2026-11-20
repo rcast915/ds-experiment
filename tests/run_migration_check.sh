@@ -15,16 +15,26 @@
 set -uo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 
-label="${1:-migration-$(date +%m%d-%H%M)}"
-export DS_STRICT=1
+#   bash tests/run_migration_check.sh --check-only <label>   re-reads an earlier
+#                                                            run's logs, no rerun
+if [[ "${1:-}" == "--check-only" ]]; then
+    label="${2:?usage: --check-only <label>}"; rc_full=0; rc_pur=0
+else
+    label="${1:-migration-$(date +%m%d-%H%M)}"
+    export DS_STRICT=1
+    bash tests/run_full.sh "$label"
+    rc_full=$?
+    bash tests/run_purification.sh "$label"
+    rc_pur=$?
+fi
 
-bash tests/run_full.sh "$label"
-rc_full=$?
-bash tests/run_purification.sh "$label"
-rc_pur=$?
-
-gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -c 'A-Za-z0-9\n' '-')"
-logs=(results/"${gpu}"_"${label}".txt results/"${gpu}"_purification_"${label}".txt)
+# Find the logs by label: nvidia-smi is not always on PATH in the container,
+# so the GPU part of the file name is not recomputed here.
+shopt -s nullglob
+logs=(results/*_"${label}".txt)
+shopt -u nullglob
+echo "  logs read: ${logs[*]:-NONE FOUND for label $label}"
+[[ ${#logs[@]} -gt 0 ]] || { echo "  VERDICT: FAIL -- no result files"; exit 1; }
 
 echo
 echo "================================ Migration check ================================"
