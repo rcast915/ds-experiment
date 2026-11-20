@@ -8,6 +8,10 @@
 #       > logs/output/baseline_$(hostname -s).out 2>&1 &
 #
 # Output is also written to results/<gpu>_baseline_<label>.txt.
+#
+# DS_BASELINE_L="64" limits the run to those lattice sizes (64 = n 4096);
+# DS_BASELINE_ROUNDS sets the rounds; XLA_FLAGS=--xla_gpu_autotune_level=0
+# switches GEMM autotuning off as a control.
 
 set -uo pipefail
 
@@ -26,7 +30,7 @@ OUT="results/$(echo "$gpu" | tr -c 'A-Za-z0-9\n' '-')_baseline_${1:-$(date +%Y%m
     bash ds_setup.sh || exit 1
     cmake -GNinja -S stablehlo_pass -B stablehlo_pass/build -DCMAKE_CXX_FLAGS="-fno-rtti" > /dev/null \
         && ninja -C stablehlo_pass/build || exit 1
-    python3 -u tests/bench_f64_baseline.py
+    python3 -u tests/bench_f64_baseline.py ${DS_BASELINE_L:-}
 } 2>&1 | tee "$OUT"
 rc=${PIPESTATUS[0]}
 echo "[run_baseline_check] Output saved to $OUT"

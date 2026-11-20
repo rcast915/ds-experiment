@@ -36,6 +36,7 @@ import os
 import json
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -204,6 +205,11 @@ def metrics(P, H, ne, P_exact, E_exact):
     }
 
 
+def _utc():
+    """Wall-clock time, to line rows up with the GPU monitor's samples."""
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
 def main():
     lattices = [int(a) for a in sys.argv[1:]] or LATTICES
     if not os.environ.get("PJRT_NAMES_AND_LIBRARY_PATHS") or not PLUGIN_SO.exists():
@@ -228,10 +234,10 @@ def main():
             in_path = os.path.join(tmp, f"in_{L}.npz")
             np.savez(in_path, P0=initial_guess(H, ne))
 
-            print(f"\n  n = {n}  (L = {L}, ne = {ne}, gap {w[ne] - w[ne - 1]:.2f})")
+            print(f"\n  n = {n}  (L = {L}, ne = {ne}, gap {w[ne] - w[ne - 1]:.2f})  started {_utc()} UTC")
             print(f"  {'run':<10} {'ms':>10} {'f64/run':>8}   {'||P-Pexact||':>12} "
-                  f"{'||P^2-P||':>10} {'|tr P - ne|':>11} {'energy err':>10}")
-            print("  " + "-" * 80)
+                  f"{'||P^2-P||':>10} {'|tr P - ne|':>11} {'energy err':>10}  done (UTC)")
+            print("  " + "-" * 92)
             base = None
             for label, dtype, bypass, extra in MODES:
                 out_path = os.path.join(tmp, f"out_{L}_{label.replace(' ', '_')}.npy")
@@ -245,7 +251,7 @@ def main():
                 m = metrics(np.load(out_path), H, ne, P_exact, E_exact)
                 ratio = f"{base / ms:7.2f}x" if base else f"{'-':>8}"
                 print(f"  {label:<10} {ms:>10.2f} {ratio}   {m['dP']:>12.1e} {m['idem']:>10.1e} "
-                      f"{m['tr']:>11.1e} {m['E']:>10.1e}")
+                      f"{m['tr']:>11.1e} {m['E']:>10.1e}  {_utc()}")
 
     print("\nNotes:")
     print("  f64/run > 1 means that run is faster than native f64.")

@@ -18,10 +18,18 @@ ways, each in its own process:
 
 The modes are interleaved over ROUNDS rounds, so a disturbance on a shared
 machine shows up as spread within a mode, not as a difference between modes.
-Outputs are compared against plain JAX (max |difference|; 0 = bitwise equal).
+Every round's output is compared against plain JAX's first-round output
+(max |difference|; 0 = bitwise equal), and the min..max over rounds is shown.
+Each round is a fresh process that autotunes its GEMMs again, so plain JAX's
+own row shows its run-to-run variation: a difference that moves between rounds,
+or that plain JAX shows against itself, comes from XLA's autotuner choosing a
+different GEMM configuration (summation order), not from the mode.
+
+Set XLA_FLAGS=--xla_gpu_autotune_level=0 to switch autotuning off as a control,
+and DS_BASELINE_ROUNDS to change the number of rounds.
 
 Usage (inside container, after ds_setup.sh):
-  python3 tests/bench_f64_baseline.py [L ...]
+  python3 tests/bench_f64_baseline.py [L ...]      # e.g. 64 for n = 4096 only
 """
 
 import glob
@@ -30,6 +38,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +48,7 @@ from bench_purification import _CODE, hamiltonian, initial_guess, ITERS, WARMUP_
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROXY_SO = PROJECT_ROOT / "pjrt_plugin" / "build" / "libds_pjrt_plugin.so"
 LATTICES = [32, 46, 64]          # n = 1024, 2116, 4096
-ROUNDS = 3
+ROUNDS = int(os.environ.get("DS_BASELINE_ROUNDS", "3"))
 
 DS_VARS = ("DS_BYPASS", "DS_TEST_PASSTHROUGH", "DS_GEMM_KERNEL", "DS_F32_MATMUL",
            "DS_STRICT", "DS_RETURN_PAIRS", "DS_PASS_MODE")
@@ -101,9 +110,10 @@ def main():
             in_path = os.path.join(tmp, f"in_{L}.npz")
             np.savez(in_path, P0=initial_guess(H, ne))
 
+            t0 = datetime.now(timezone.utc).strftime("%H:%M:%S")
             times = {label: [] for label, _, _ in ms}
             prods = {label: set() for label, _, _ in ms}
-            outs = {}
+            outs = {label: [] for label, _, _ in ms}
             for rnd in range(ROUNDS):
                 for label, so, extra in ms:
                     out_path = os.path.join(tmp, f"out_{L}_{rnd}_{label[:5].replace(' ', '_')}.npy")
@@ -113,12 +123,13 @@ def main():
                         rc = 1
                         continue
                     times[label].append(t)
-                    outs.setdefault(label, np.load(out_path))
+                    outs[label].append(np.load(out_path))
 
-            print(f"\n  n = {n}  (L = {L})")
+            t1 = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            print(f"\n  n = {n}  (L = {L})  ran {t0} .. {t1} UTC")
             print(f"  {'run':<12} {'median ms':>10} {'min':>9} {'max':>9} {'vs plain':>9}  "
-                  f"{'max |P - P_plain|':>17}  serialized by (proxy log)")
-            print("  " + "-" * 96)
+                  f"{'max |P - P_plain|, rounds':>27}  serialized by (proxy log)")
+            print("  " + "-" * 106)
             base = np.median(times["plain JAX"]) if times["plain JAX"] else None
             for label, _, _ in ms:
                 t = times[label]
@@ -127,16 +138,23 @@ def main():
                     continue
                 med = np.median(t)
                 rel = f"{med / base:8.3f}x" if base else f"{'-':>9}"
-                diff = (np.max(np.abs(outs[label] - outs["plain JAX"]))
-                        if "plain JAX" in outs else float("nan"))
+                if outs["plain JAX"]:
+                    ref = outs["plain JAX"][0]
+                    d = [float(np.max(np.abs(o - ref))) for o in outs[label]]
+                    diff = f"{min(d):.1e}..{max(d):.1e}"
+                else:
+                    diff = "nan"
                 prod = ", ".join(sorted(prods[label])) or "(not logged)"
                 print(f"  {label:<12} {med:>10.2f} {min(t):>9.2f} {max(t):>9.2f} {rel}  "
-                      f"{diff:>17.1e}  {prod}")
+                      f"{diff:>27}  {prod}")
 
     print("\nNotes:")
     print("  vs plain = median time / plain JAX median time (1.000x = no change).")
     print("  min/max over the rounds: a mode whose spread covers the others' medians shows no")
     print("  measurable difference. 0.0e+00 = output bitwise identical to plain JAX.")
+    print("  max |P - P_plain|: min..max over rounds, against plain JAX's first round; plain")
+    print("  JAX's own row is its run-to-run variation (fresh process, fresh autotuning).")
+    print(f"  XLA_FLAGS: {os.environ.get('XLA_FLAGS', '(unset)')}")
     print("  DS_BYPASS=1 is the f64 baseline in every other benchmark; it is not downgraded.")
     print("  The 1.16.3 row is the f64 program as the pass receives it, compiled natively.")
     return rc

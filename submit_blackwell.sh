@@ -88,14 +88,25 @@ fi
 export DS_IMAGE_ID="$DS_IMAGE, pulled $(date -r "$SIF" +%F), sif sha256 $(cat "$SIF.sha256")..."
 export APPTAINERENV_DS_IMAGE_ID="$DS_IMAGE_ID" SINGULARITYENV_DS_IMAGE_ID="$DS_IMAGE_ID"
 
+# GPU clock / power / temperature / processes, logged on the host for the
+# whole job (tests/gpu_monitor.sh), to tell clock drift from contention.
+LABEL="${SLURM_JOB_ID:-$(hostname -s)-$(date +%m%d-%H%M)}"
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+MON_PREFIX="$(pwd)/results/$(echo "${GPU_NAME:-unknown-gpu}" | tr -c 'A-Za-z0-9\n' '-')_${LABEL}"
+mkdir -p "$(dirname "$MON_PREFIX")"
+MON_PIDS="$(bash "$(pwd)/tests/gpu_monitor.sh" start "$MON_PREFIX" || true)"
+# A killed job stops the loggers too (Slurm's cgroup would; nohup runs would not).
+trap '[ -n "$MON_PIDS" ] && kill $MON_PIDS 2>/dev/null; exit 143' TERM INT
+rc=0
+
 echo "Starting full DS run..."
 "$CT" exec --nv --writable \
   --bind "$(pwd)":/src/ds_experiment \
   "$SANDBOX" bash -c "
     cd /src/ds_experiment
-    bash ${DS_JOB_SCRIPT:-tests/run_full.sh} '${SLURM_JOB_ID:-$(hostname -s)-$(date +%m%d-%H%M)}'
-  "
-rc=$?
+    bash ${DS_JOB_SCRIPT:-tests/run_full.sh} '$LABEL'
+  " || rc=$?
+bash "$(pwd)/tests/gpu_monitor.sh" stop "$MON_PIDS" "$MON_PREFIX"
 
 echo "Job finished: $(date) (exit $rc)"
 exit $rc
